@@ -25,7 +25,7 @@ def get_labelspace(labelspace_name):
 
 
 def load_dsg_to_db(
-    object_labelspace, room_labelspace, neo4j_uri, neo4j_creds, scene_graph
+    object_labelspace, room_labelspace, image_folder_root, neo4j_uri, neo4j_creds, scene_graph
 ):
     id_to_object_label = get_labelspace(object_labelspace)
     scene_graph.metadata.add({"labelspace": id_to_object_label})
@@ -54,4 +54,4 @@ def load_dsg_to_db(
         initialize_db(db)
         # Load the scene graph into the DB
         print("Loading the scene graph into the database.")
-        spark_dsg_to_db(scene_graph, db)
+        spark_dsg_to_db(scene_graph, image_folder_root, db)

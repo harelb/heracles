@@ -1,3 +1,6 @@
+import os
+import glob
+import json
 import neo4j
 import parse
 import spark_dsg
@@ -19,6 +22,7 @@ def initialize_db(db):
     try_drop_index(db, "mesh_place_node_symbol")
     try_drop_index(db, "room_node_symbol")
     try_drop_index(db, "building_node_symbol")
+    try_drop_index(db, "observation_node_symbol")
 
     db.execute(
         f"CREATE INDEX object_node_symbol FOR (n:{constants.OBJECTS}) ON (n.nodeSymbol)"
@@ -35,11 +39,14 @@ def initialize_db(db):
     db.execute(
         f"CREATE INDEX building_node_symbol FOR (n:{constants.BUILDINGS}) ON (n.nodeSymbol)"
     )
+    db.execute(
+        f"CREATE INDEX observation_node_symbol FOR (n:{constants.OBSERVATIONS}) ON (n.nodeSymbol)"
+    )
 
 
 # Insert all nodes and edges for each layer
-def spark_dsg_to_db(G, db):
-    add_objects_from_dsg(G, db)
+def spark_dsg_to_db(G, image_folder_root, db):
+    add_objects_from_dsg(G, image_folder_root, db)
     add_places_from_dsg(G, db)
     add_mesh_places_from_dsg(G, db)
     add_rooms_from_dsg(G, db)
@@ -48,12 +55,89 @@ def spark_dsg_to_db(G, db):
 
 
 # Inserting objects
-def add_objects_from_dsg(G, db):
-    objects = [
-        obj_to_dict(G.metadata.get()["labelspace"], o)
-        for o in G.get_layer(spark_dsg.DsgLayers.OBJECTS).nodes
-    ]
+def add_objects_from_dsg(G, image_folder_root, db):
+    objects = []
+    for o in G.get_layer(spark_dsg.DsgLayers.OBJECTS).nodes:
+        d = obj_to_dict(G.metadata.get()["labelspace"], o)
+        if "image_folder" in d and d["image_folder"]:
+            d["image_folder"] = os.path.join(
+                image_folder_root, os.path.basename(d["image_folder"])
+            )
+        objects.append(d)
+
     insert_objects_to_db(db, objects)
+    
+    # Process observations
+    observations = []
+    object_observation_edges = []
+    
+    for obj in objects:
+        if "image_folder" not in obj or not obj["image_folder"]:
+            continue
+            
+        image_folder = obj["image_folder"]
+        meta_files = glob.glob(os.path.join(image_folder, "*_meta.json"))
+        
+        for meta_file in meta_files:
+            try:
+                with open(meta_file, 'r') as f:
+                    data = json.load(f)
+                    
+                # Construct observation ID/Symbol: ObjectSymbol_Timestamp
+                timestamp_ns = data.get("timestamp_ns")
+                if timestamp_ns is None:
+                    continue
+                    
+                obs_symbol = f"{obj['nodeSymbol']}_{timestamp_ns}"
+                
+                obs_dict = {
+                    "nodeSymbol": obs_symbol,
+                    "timestamp_ns": timestamp_ns,
+                    "mask_file": data.get("mask_file", ""),
+                }
+                
+                # Extract 2D Bounding Box
+                if "bbox_2d" in data:
+                     bbox_2d = data["bbox_2d"]
+                     obs_dict["bbox_2d_min_x"] = bbox_2d.get("min_x")
+                     obs_dict["bbox_2d_min_y"] = bbox_2d.get("min_y")
+                     obs_dict["bbox_2d_max_x"] = bbox_2d.get("max_x")
+                     obs_dict["bbox_2d_max_y"] = bbox_2d.get("max_y")
+                
+                observations.append(obs_dict)
+                object_observation_edges.append({"from": obj["nodeSymbol"], "to": obs_symbol})
+                
+            except Exception as e:
+                print(f"Failed to parse observation file {meta_file}: {e}")
+
+    if observations:
+        insert_observations_to_db(db, observations)
+        insert_edges(
+            db,
+            constants.HAS_OBSERVATION,
+            constants.OBJECTS,
+            constants.OBSERVATIONS,
+            object_observation_edges,
+        )
+
+
+def insert_observations_to_db(db, observations):
+    return db.execute(
+        f"""
+    WITH $observations AS observations
+    UNWIND observations AS obs
+    MERGE (:{constants.OBSERVATIONS} {{
+        nodeSymbol: obs.nodeSymbol, 
+        timestamp_ns: obs.timestamp_ns,
+        mask_file: obs.mask_file,
+        bbox_2d_min_x: obs.bbox_2d_min_x,
+        bbox_2d_min_y: obs.bbox_2d_min_y,
+        bbox_2d_max_x: obs.bbox_2d_max_x,
+        bbox_2d_max_y: obs.bbox_2d_max_y
+    }})
+    """,
+        observations=observations,
+    )
 
 
 def obj_to_dict(node_classes, obj):
@@ -74,6 +158,19 @@ def obj_to_dict(node_classes, obj):
     # d["color_r"] = attrs.color[0]
     # d["color_g"] = attrs.color[1]
     # d["color_b"] = attrs.color[2]
+
+    # Specific to Khronos objects
+    if hasattr(attrs, "image_folder"):
+        d["image_folder"] = attrs.image_folder
+    if hasattr(attrs, "details"):
+        d["details"] = str(attrs.details)
+    
+    if hasattr(attrs, "first_observed_ns"):
+         d["first_observed_ns"] = attrs.first_observed_ns
+
+    if hasattr(attrs, "last_observed_ns"):
+         d["last_observed_ns"] = attrs.last_observed_ns
+
     return d
 
 
@@ -89,7 +186,7 @@ def insert_objects_to_db(db, objects):
     WITH $objects AS objects
     UNWIND objects AS object
     WITH point({{x: object.pos_x, y: object.pos_y, z: object.pos_z}}) AS p3d, point({{x: object.bbox_x, y: object.bbox_y, z: object.bbox_z}}) AS bb3d, point({{x: object.bbox_l, y: object.bbox_w, z: object.bbox_h}}) AS bbdim,  object
-    MERGE (:{constants.OBJECTS} {{nodeSymbol: object.nodeSymbol, center: p3d, bbox_center: bb3d, bbox_dim: bbdim, class: object.class, name: object.name}})
+    MERGE (:{constants.OBJECTS} {{nodeSymbol: object.nodeSymbol, center: p3d, bbox_center: bb3d, bbox_dim: bbdim, class: object.class, name: object.name, image_folder: object.image_folder, details: object.details, first_observed_ns: object.first_observed_ns, last_observed_ns: object.last_observed_ns}})
     """,
         objects=objects,
     )

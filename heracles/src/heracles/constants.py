@@ -6,8 +6,10 @@ import spark_dsg
 MESH_PLACES = "MeshPlace"
 PLACES = "Place"
 OBJECTS = "Object"
+OBSERVATIONS = "Observation"
 ROOMS = "Room"
 BUILDINGS = "Building"
+HAS_OBSERVATION = "HAS_OBSERVATION"
 
 # Mappings to/from heracles and spark_dsg
 SPARK_TO_HERACLES_LAYER_NAMES = MappingProxyType(

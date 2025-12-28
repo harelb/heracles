@@ -27,6 +27,7 @@ if __name__ == "__main__":
         "--object_labelspace", type=str, default="ade20k_mit_label_space.yaml"
     )
     parser.add_argument("--room_labelspace", type=str, default="b45_label_space.yaml")
+    parser.add_argument("--image_root", type=str, default ="")
     args = parser.parse_args()
     assert args.neo4j_uri, (
         'No NEO4J_URI provided -- either provide as an arg or set "$HERACLES_NEO4J_URI"'
@@ -40,6 +41,7 @@ if __name__ == "__main__":
     load_dsg_to_db(
         args.object_labelspace,
         args.room_labelspace,
+        args.image_root,
         args.neo4j_uri,
         neo4j_creds,
         scene_graph,
