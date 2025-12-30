@@ -163,7 +163,7 @@ def obj_to_dict(node_classes, obj):
     if hasattr(attrs, "image_folder"):
         d["image_folder"] = attrs.image_folder
     if hasattr(attrs, "details"):
-        d["details"] = str(attrs.details)
+        d["details"] = json.dumps(attrs.details)
     
     if hasattr(attrs, "first_observed_ns"):
          d["first_observed_ns"] = attrs.first_observed_ns
@@ -186,7 +186,16 @@ def insert_objects_to_db(db, objects):
     WITH $objects AS objects
     UNWIND objects AS object
     WITH point({{x: object.pos_x, y: object.pos_y, z: object.pos_z}}) AS p3d, point({{x: object.bbox_x, y: object.bbox_y, z: object.bbox_z}}) AS bb3d, point({{x: object.bbox_l, y: object.bbox_w, z: object.bbox_h}}) AS bbdim,  object
-    MERGE (:{constants.OBJECTS} {{nodeSymbol: object.nodeSymbol, center: p3d, bbox_center: bb3d, bbox_dim: bbdim, class: object.class, name: object.name, image_folder: object.image_folder, details: object.details, first_observed_ns: object.first_observed_ns, last_observed_ns: object.last_observed_ns}})
+    MERGE (n:Object {{nodeSymbol: object.nodeSymbol}})
+    SET n.center = p3d,
+        n.bbox_center = bb3d,
+        n.bbox_dim = bbdim,
+        n.class = object.class,
+        n.name = object.name,
+        n.image_folder = object.image_folder,
+        n.details = object.details,
+        n.first_observed_ns = object.first_observed_ns,
+        n.last_observed_ns = object.last_observed_ns
     """,
         objects=objects,
     )
