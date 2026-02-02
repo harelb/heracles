@@ -607,8 +607,24 @@ def db_to_spark_object(o, label_to_semantic_id):
     attrs = spark_dsg.ObjectNodeAttributes()
     attrs.name = o["nodeSymbol"]
     attrs.position = o["center"]
-    attrs.semantic_label = label_to_semantic_id[o["class"]]
+    
+    # Robust Label Lookup
+    cls_name = o["class"]
+    if cls_name in label_to_semantic_id:
+        attrs.semantic_label = label_to_semantic_id[cls_name]
+    else:
+        # Fallback to 0 if unknown, or try to find a generic one?
+        # Assuming 0 is valid or "Unknown"
+        # If we can't find it, we just set 0.
+        # Ideally we print a warning?
+        # print(f"Warning: Unknown class '{cls_name}', using default 0.")
+        attrs.semantic_label = 0
+        
     attrs.name = o["name"]
+    # If name is empty, maybe use class?
+    if not attrs.name:
+         attrs.name = cls_name
+         
     attrs.bounding_box = spark_dsg.BoundingBox(
         [o["bbox_dim"][0], o["bbox_dim"][1], o["bbox_dim"][2]],  # dimensions
         [o["bbox_center"][0], o["bbox_center"][1], o["bbox_center"][2]],  # center
@@ -632,10 +648,40 @@ def db_to_spark_dsg(
     new_scene_graph = spark_dsg.DynamicSceneGraph()
     new_scene_graph.clear(True)  # Removes all layers
 
+    # -- Dynamic Label Expansion Logic --
+    # Hack: Pre-fetch objects to find unknown classes so we can add them to labelspace
+    # We iterate layers, if we match OBJECTS, we fetch records early.
+    
+    # We need to process layers in order or just find the Objects layer key
+    # spark_layer_id_to_layer_name maps generic ID to heracles string
+    # We look for constants.OBJECTS
+    
+    # Let's pre-scan objects
+    records_map = {} # Cache records to avoid repeated DB calls
+    
+    for spark_layer_id, heracles_layer_name in spark_layer_id_to_layer_name.items():
+        records, summary, keys = get_layer_nodes(db, heracles_layer_name)
+        # Consure iterator to list so we can iterate twice
+        records_list = list(records)
+        records_map[heracles_layer_name] = records_list
+        
+        if heracles_layer_name == constants.OBJECTS:
+            # Update label map
+            next_id = max(label_to_semantic_id.values()) + 1 if label_to_semantic_id else 1
+            
+            for rec in records_list:
+                c = rec["class"]
+                if c and c not in label_to_semantic_id:
+                    # Assign new ID
+                    label_to_semantic_id[c] = next_id
+                    print(f"Assigning new class '{c}' -> {next_id}")
+                    next_id += 1
+
     object_labelspace = spark_dsg.Labelspace(
         {v: k for k, v in label_to_semantic_id.items()}
     )
     new_scene_graph.set_labelspace(object_labelspace, 2, 0)
+    
     # Add each layer (LayerID, PythonPartitionID, Name)
     for spark_layer_id, heracles_layer_name in spark_layer_id_to_layer_name.items():
         if spark_layer_id == 20:
@@ -650,7 +696,10 @@ def db_to_spark_dsg(
                 0,
                 constants.HERACLES_TO_SPARK_LAYER_NAMES[heracles_layer_name],
             )
-        records, summary, keys = get_layer_nodes(db, heracles_layer_name)
+            
+        # Use cached records
+        records = records_map.get(heracles_layer_name, [])
+        # records, summary, keys = get_layer_nodes(db, heracles_layer_name) # OLD call
         # Assign the function to get the attributes
         # TODO - Can we have a generic function for retreiving all of the attributes?
         attr_func = None
