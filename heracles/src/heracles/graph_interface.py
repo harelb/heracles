@@ -23,6 +23,7 @@ def initialize_db(db):
     try_drop_index(db, "room_node_symbol")
     try_drop_index(db, "building_node_symbol")
     try_drop_index(db, "observation_node_symbol")
+    try_drop_index(db, "agent_node_symbol")
 
     db.execute(
         f"CREATE INDEX object_node_symbol FOR (n:{constants.OBJECTS}) ON (n.nodeSymbol)"
@@ -42,10 +43,14 @@ def initialize_db(db):
     db.execute(
         f"CREATE INDEX observation_node_symbol FOR (n:{constants.OBSERVATIONS}) ON (n.nodeSymbol)"
     )
+    db.execute(
+        f"CREATE INDEX agent_node_symbol FOR (n:{constants.AGENTS}) ON (n.nodeSymbol)"
+    )
 
 
 # Insert all nodes and edges for each layer
 def spark_dsg_to_db(G, image_folder_root, db):
+    add_agents_from_dsg(G, image_folder_root, db)
     add_objects_from_dsg(G, image_folder_root, db)
     add_places_from_dsg(G, db)
     add_mesh_places_from_dsg(G, db)
@@ -53,6 +58,50 @@ def spark_dsg_to_db(G, image_folder_root, db):
     add_buildings_from_dsg(G, db)
     add_edges_from_dsg(G, db)
 
+
+# Inserting agents
+def add_agents_from_dsg(G, image_folder_root, db):
+    agents = []
+    layer = G.get_layer(spark_dsg.DsgLayers.AGENTS)
+    if layer is None:
+        return
+        
+    for a in layer.nodes:
+        d = agent_to_dict(a)
+        if "image_folder" in d and d["image_folder"]:
+            d["image_folder"] = os.path.join(
+                image_folder_root, os.path.basename(d["image_folder"])
+            )
+        agents.append(d)
+
+    if agents:
+        insert_agents_to_db(db, agents)
+
+def agent_to_dict(agent):
+    attrs = agent.attributes
+    d = {}
+    d["nodeSymbol"] = agent.id.str(True)
+    d["pos_x"] = attrs.position[0]
+    d["pos_y"] = attrs.position[1]
+    d["pos_z"] = attrs.position[2]
+    
+    if hasattr(attrs, "image_folder"):
+        d["image_folder"] = attrs.image_folder
+        
+    return d
+
+def insert_agents_to_db(db, agents):
+    return db.execute(
+        f"""
+    WITH $agents AS agents
+    UNWIND agents AS agent
+    WITH point({{x: agent.pos_x, y: agent.pos_y, z: agent.pos_z}}) AS p3d, agent
+    MERGE (n:{constants.AGENTS} {{nodeSymbol: agent.nodeSymbol}})
+    SET n.center = p3d,
+        n.image_folder = agent.image_folder
+    """,
+        agents=agents,
+    )
 
 # Inserting objects
 def add_objects_from_dsg(G, image_folder_root, db):

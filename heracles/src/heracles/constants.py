@@ -6,6 +6,7 @@ import spark_dsg
 MESH_PLACES = "MeshPlace"
 PLACES = "Place"
 OBJECTS = "Object"
+AGENTS = "Agent"
 OBSERVATIONS = "Observation"
 ROOMS = "Room"
 BUILDINGS = "Building"
@@ -17,6 +18,7 @@ SPARK_TO_HERACLES_LAYER_NAMES = MappingProxyType(
         spark_dsg.DsgLayers.MESH_PLACES: MESH_PLACES,
         spark_dsg.DsgLayers.PLACES: PLACES,
         spark_dsg.DsgLayers.OBJECTS: OBJECTS,
+        spark_dsg.DsgLayers.AGENTS: AGENTS,
         spark_dsg.DsgLayers.ROOMS: ROOMS,
         spark_dsg.DsgLayers.BUILDINGS: BUILDINGS,
     }
@@ -26,6 +28,7 @@ HERACLES_TO_SPARK_LAYER_NAMES = MappingProxyType(
         MESH_PLACES: spark_dsg.DsgLayers.MESH_PLACES,
         PLACES: spark_dsg.DsgLayers.PLACES,
         OBJECTS: spark_dsg.DsgLayers.OBJECTS,
+        AGENTS: spark_dsg.DsgLayers.AGENTS,
         ROOMS: spark_dsg.DsgLayers.ROOMS,
         BUILDINGS: spark_dsg.DsgLayers.BUILDINGS,
     }
