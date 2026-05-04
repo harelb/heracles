@@ -1,11 +1,78 @@
-import os
+"""
+Bidirectional conversion between spark_dsg scene graphs and Neo4j.
+
+Design
+------
+Node conversion uses **property-presence** rather than hardcoded per-type
+functions.  ``node_to_dict()`` inspects which attributes a node actually has
+(via ``hasattr``) and stores whatever it finds, along with an ``attr_type``
+string (the Python class name) so reconstruction can create the right C++
+attribute class.
+
+This makes the pipeline robust to new attribute types (e.g.,
+TravNodeAttributes in MESH_PLACES, KhronosObjectAttributes in OBJECTS)
+without code changes.
+
+Lossy properties
+----------------
+Some attribute data is NOT round-tripped through Neo4j:
+- TravNodeAttributes boundary (radii, states) — deferred, store only position
+- Place2dNodeAttributes boundary (polygon points) — deferred
+- AgentNodeAttributes (world_R_body, dbow) — not stored
+
+The source JSON file should be considered the authoritative copy.  Neo4j
+stores the subset needed for visualization and editing.
+
+Edge handling remains layer-aware since edge types are determined by the
+layer relationship (intralayer vs interlayer), not by attribute types.
+"""
+
 import glob
 import json
+import logging
+import os
 import neo4j
 import parse
 import spark_dsg
 
 from . import constants
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Attribute type registry for reconstruction (Neo4j → spark_dsg)
+# ---------------------------------------------------------------------------
+
+# Maps attr_type strings (stored on Neo4j nodes) to spark_dsg attribute
+# constructors.  Used by db_record_to_spark_attrs() to create the right
+# C++ class when reconstructing a DSG from the database.
+#
+# Lives here (not in constants.py) because it maps to C++ classes and is
+# only used during reconstruction — it's conversion logic, not a shared
+# constant.
+ATTR_TYPE_REGISTRY = {
+    "ObjectNodeAttributes": spark_dsg.ObjectNodeAttributes,
+    "PlaceNodeAttributes": spark_dsg.PlaceNodeAttributes,
+    "Place2dNodeAttributes": spark_dsg.Place2dNodeAttributes,
+    "RoomNodeAttributes": spark_dsg.RoomNodeAttributes,
+    "NodeAttributes": spark_dsg.NodeAttributes,
+}
+
+# Conditionally register types that may not exist in older spark_dsg versions.
+if hasattr(spark_dsg, "KhronosObjectAttributes"):
+    ATTR_TYPE_REGISTRY["KhronosObjectAttributes"] = spark_dsg.KhronosObjectAttributes
+if hasattr(spark_dsg, "TraversabilityNodeAttributes"):
+    ATTR_TYPE_REGISTRY["TraversabilityNodeAttributes"] = (
+        spark_dsg.TraversabilityNodeAttributes
+    )
+if hasattr(spark_dsg, "TravNodeAttributes"):
+    ATTR_TYPE_REGISTRY["TravNodeAttributes"] = spark_dsg.TravNodeAttributes
+
+
+# ---------------------------------------------------------------------------
+# Database initialization
+# ---------------------------------------------------------------------------
 
 
 def initialize_db(db):
@@ -48,148 +115,142 @@ def initialize_db(db):
     )
 
 
-# Insert all nodes and edges for each layer
-def spark_dsg_to_db(G, image_folder_root, db):
-    add_agents_from_dsg(G, image_folder_root, db)
-    add_objects_from_dsg(G, image_folder_root, db)
-    add_places_from_dsg(G, db)
-    add_mesh_places_from_dsg(G, db)
-    add_rooms_from_dsg(G, db)
-    add_buildings_from_dsg(G, db)
-    add_edges_from_dsg(G, db)
+# ---------------------------------------------------------------------------
+# Generic node → dict conversion (spark_dsg → flat dict for Neo4j)
+# ---------------------------------------------------------------------------
 
 
-# Inserting agents
-def add_agents_from_dsg(G, image_folder_root, db):
-    agents = []
-    layer = G.get_layer(spark_dsg.DsgLayers.AGENTS)
-    if layer is None:
-        return
-        
-    for a in layer.nodes:
-        d = agent_to_dict(a)
-        if "image_folder" in d and d["image_folder"]:
-            d["image_folder"] = os.path.join(
-                image_folder_root, os.path.basename(d["image_folder"])
-            )
-        agents.append(d)
+def node_to_dict(node, object_labelspace=None, room_labelspace=None):
+    """Convert any spark_dsg node to a flat dict for Neo4j storage.
 
-    if agents:
-        insert_agents_to_db(db, agents)
 
-def agent_to_dict(agent):
-    attrs = agent.attributes
-    d = {}
-    d["nodeSymbol"] = agent.id.str(True)
-    d["pos_x"] = attrs.position[0]
-    d["pos_y"] = attrs.position[1]
-    d["pos_z"] = attrs.position[2]
-    
-    if hasattr(attrs, "image_folder"):
-        d["image_folder"] = attrs.image_folder
-        
-    return d
+    Uses property presence — works with any attribute type without
+    hardcoding.  Stores ``attr_type`` so reconstruction can create the
+    right C++ class.  Warns if a semantic_label is not found in the
+    labelspace.
 
-def insert_agents_to_db(db, agents):
-    return db.execute(
-        f"""
-    WITH $agents AS agents
-    UNWIND agents AS agent
-    WITH point({{x: agent.pos_x, y: agent.pos_y, z: agent.pos_z}}) AS p3d, agent
-    MERGE (n:{constants.AGENTS} {{nodeSymbol: agent.nodeSymbol}})
-    SET n.center = p3d,
-        n.image_folder = agent.image_folder
-    """,
-        agents=agents,
-    )
+    Note: some attribute data (boundary details, agent poses, mesh
+    connections) is intentionally NOT stored.  See module docstring.
+    """
+    attrs = node.attributes
+    d = {
+        "nodeSymbol": node.id.str(True),
+        "attr_type": type(attrs).__name__,
+        "pos_x": float(attrs.position[0]),
+        "pos_y": float(attrs.position[1]),
+        "pos_z": float(attrs.position[2]),
+    }
 
-# Inserting objects
-def add_objects_from_dsg(G, image_folder_root, db):
-    objects = []
-    for o in G.get_layer(spark_dsg.DsgLayers.OBJECTS).nodes:
-        d = obj_to_dict(G.metadata.get()["labelspace"], o)
-        if "image_folder" in d and d["image_folder"]:
-            d["image_folder"] = os.path.join(
-                image_folder_root, os.path.basename(d["image_folder"])
-            )
-        objects.append(d)
-
-    insert_objects_to_db(db, objects)
-    
-    # Process observations
-    observations = []
-    object_observation_edges = []
-    
-    for obj in objects:
-        if "image_folder" not in obj or not obj["image_folder"]:
-            continue
-            
-        image_folder = obj["image_folder"]
-        meta_files = glob.glob(os.path.join(image_folder, "*_meta.json"))
-        
-        for meta_file in meta_files:
-            try:
-                with open(meta_file, 'r') as f:
-                    data = json.load(f)
-                    
-                # Construct observation ID/Symbol: ObjectSymbol_Timestamp
-                timestamp_ns = data.get("timestamp_ns")
-                if timestamp_ns is None:
-                    continue
-                    
-                obs_symbol = f"{obj['nodeSymbol']}_{timestamp_ns}"
-                
-                obs_dict = {
-                    "nodeSymbol": obs_symbol,
-                    "timestamp_ns": timestamp_ns,
-                    "mask_file": data.get("mask_file", ""),
-                }
-                
-                # Extract 2D Bounding Box
-                if "bbox_2d" in data:
-                     bbox_2d = data["bbox_2d"]
-                     obs_dict["bbox_2d_min_x"] = bbox_2d.get("min_x")
-                     obs_dict["bbox_2d_min_y"] = bbox_2d.get("min_y")
-                     obs_dict["bbox_2d_max_x"] = bbox_2d.get("max_x")
-                     obs_dict["bbox_2d_max_y"] = bbox_2d.get("max_y")
-                
-                observations.append(obs_dict)
-                object_observation_edges.append({"from": obj["nodeSymbol"], "to": obs_symbol})
-                
-            except Exception as e:
-                print(f"Failed to parse observation file {meta_file}: {e}")
-
-    if observations:
-        insert_observations_to_db(db, observations)
-        insert_edges(
-            db,
-            constants.HAS_OBSERVATION,
-            constants.OBJECTS,
-            constants.OBSERVATIONS,
-            object_observation_edges,
+    # SemanticNodeAttributes fields (optional).
+    if hasattr(attrs, "semantic_label"):
+        ls = (
+            room_labelspace
+            if isinstance(attrs, spark_dsg.RoomNodeAttributes)
+            else object_labelspace
         )
+        label_key = str(attrs.semantic_label)
+        if ls and label_key in ls:
+            d["class"] = ls[label_key]
+        else:
+            logger.warning(
+                "Node %s: semantic_label %s not in labelspace",
+                d["nodeSymbol"],
+                label_key,
+            )
 
+    if hasattr(attrs, "name") and attrs.name:
+        d["name"] = attrs.name
 
-def insert_observations_to_db(db, observations):
-    return db.execute(
-        f"""
-    WITH $observations AS observations
-    UNWIND observations AS obs
-    MERGE (:{constants.OBSERVATIONS} {{
-        nodeSymbol: obs.nodeSymbol, 
-        timestamp_ns: obs.timestamp_ns,
-        mask_file: obs.mask_file,
-        bbox_2d_min_x: obs.bbox_2d_min_x,
-        bbox_2d_min_y: obs.bbox_2d_min_y,
-        bbox_2d_max_x: obs.bbox_2d_max_x,
-        bbox_2d_max_y: obs.bbox_2d_max_y
-    }})
-    """,
-        observations=observations,
-    )
+    # Color (SemanticNodeAttributes — 3 uint8 RGB values).
+    if hasattr(attrs, "color"):
+        try:
+            c = attrs.color
+            d["color_r"] = int(c[0])
+            d["color_g"] = int(c[1])
+            d["color_b"] = int(c[2])
+        except Exception:
+            pass
+
+    # Bounding box (ObjectNodeAttributes, RoomNodeAttributes).
+    if hasattr(attrs, "bounding_box"):
+        try:
+            if attrs.bounding_box.is_valid():
+                bb = attrs.bounding_box
+                d["bbox_x"] = float(bb.world_P_center[0])
+                d["bbox_y"] = float(bb.world_P_center[1])
+                d["bbox_z"] = float(bb.world_P_center[2])
+                d["bbox_l"] = float(bb.dimensions[0])
+                d["bbox_w"] = float(bb.dimensions[1])
+                d["bbox_h"] = float(bb.dimensions[2])
+        except Exception as e:
+            logger.warning(
+                "Node %s: failed to read bounding_box: %s",
+                d["nodeSymbol"],
+                e,
+            )
+
+    # Registered flag (ObjectNodeAttributes).
+    if hasattr(attrs, "registered"):
+        d["registered"] = bool(attrs.registered)
+
+    # Base attributes (all nodes have these).
+    d["is_active"] = bool(attrs.is_active)
+    d["is_predicted"] = bool(attrs.is_predicted)
+
+    # Distance to nearest obstacle (PlaceNodeAttributes).
+    if hasattr(attrs, "distance"):
+        d["distance"] = float(attrs.distance)
+
+    # Observation timestamps (Traversability, TravNode have single int;
+    # KhronosObjectAttributes has lists of ints — store as-is either way).
+    if hasattr(attrs, "first_observed_ns"):
+        val = attrs.first_observed_ns
+        if isinstance(val, (list, tuple)):
+            d["first_observed_ns"] = [int(v) for v in val]
+        else:
+            d["first_observed_ns"] = int(val)
+    if hasattr(attrs, "last_observed_ns"):
+        val = attrs.last_observed_ns
+        if isinstance(val, (list, tuple)):
+            d["last_observed_ns"] = [int(v) for v in val]
+        else:
+            d["last_observed_ns"] = int(val)
+
+    # Room class probabilities — stored as parallel key/value lists
+    # since Neo4j doesn't support map properties.
+    if hasattr(attrs, "semantic_class_probabilities"):
+        probs = attrs.semantic_class_probabilities
+        if probs:
+            d["class_prob_keys"] = list(probs.keys())
+            d["class_prob_values"] = [float(v) for v in probs.values()]
+
+    # TravNodeAttributes boundary (radii + states as flat lists).
+    # States are TraversabilityState enums stored as ints.
+    if hasattr(attrs, "radii"):
+        d["radii"] = [float(r) for r in attrs.radii]
+        d["states"] = [int(s) for s in attrs.states]
+        d["min_radius"] = float(attrs.min_radius)
+        d["max_radius"] = float(attrs.max_radius)
+
+    # Place2dNodeAttributes boundary (polygon of 3D points).
+    # Stored as temporary flat lists (boundary_x/y/z), then converted
+    # to a native Neo4j Point3D list by insert_nodes_to_db.
+    if hasattr(attrs, "boundary") and isinstance(attrs.boundary, list):
+        boundary = attrs.boundary
+        if boundary:
+            d["boundary_x"] = [float(pt[0]) for pt in boundary]
+            d["boundary_y"] = [float(pt[1]) for pt in boundary]
+            d["boundary_z"] = [float(pt[2]) for pt in boundary]
+
+    return d
 
 
 def obj_to_dict(node_classes, obj):
+    """Legacy per-type conversion for ObjectNodeAttributes.
+
+    Kept for backward compatibility (imported by test_db.py).
+    New code should use node_to_dict() instead.
+    """
     attrs = obj.attributes
     d = {}
     d["nodeSymbol"] = obj.id.str(True)
@@ -204,188 +265,348 @@ def obj_to_dict(node_classes, obj):
     d["bbox_h"] = attrs.bounding_box.dimensions[2]
     d["class"] = node_classes[str(attrs.semantic_label)]
     d["name"] = attrs.name  # SemanticNodeAttribute::name
-    # d["color_r"] = attrs.color[0]
-    # d["color_g"] = attrs.color[1]
-    # d["color_b"] = attrs.color[2]
 
     # Specific to Khronos objects
     if hasattr(attrs, "image_folder"):
         d["image_folder"] = attrs.image_folder
     if hasattr(attrs, "details"):
         d["details"] = json.dumps(attrs.details)
-    
+
     if hasattr(attrs, "first_observed_ns"):
-         d["first_observed_ns"] = attrs.first_observed_ns
+        d["first_observed_ns"] = attrs.first_observed_ns
 
     if hasattr(attrs, "last_observed_ns"):
-         d["last_observed_ns"] = attrs.last_observed_ns
+        d["last_observed_ns"] = attrs.last_observed_ns
 
     return d
 
 
-def insert_objects_to_db(db, objects):
-    return db.execute(
-        #    f"""
-        #    WITH $objects AS objects
-        #    UNWIND objects AS object
-        #    WITH point({{x: object.pos_x, y: object.pos_y, z: object.pos_z}}) AS p3d, point({{x: object.bbox_x, y: object.bbox_y, z: object.bbox_z}}) AS bb3d, point({{x: object.bbox_l, y: object.bbox_w, z: object.bbox_h}}) AS bbdim, object
-        #    MERGE (:{constants.OBJECTS} {{nodeSymbol: object.nodeSymbol, center: p3d, bbox_center: bb3d, bbox_dim: bbdim, class: object.class}})
-        #    """,
+# ---------------------------------------------------------------------------
+# Generic bulk insert (flat dicts → Neo4j nodes)
+# ---------------------------------------------------------------------------
+
+
+def insert_nodes_to_db(db, layer_label, node_dicts):
+    """Bulk insert nodes into Neo4j for a given layer.
+
+    Uses MERGE on nodeSymbol (idempotent).  Position is stored as a Neo4j
+    Point3D.  All other dict keys are set as scalar properties via ``n += node``.
+
+    If any nodes have boundary_x/y/z (Place2d polygon points), a follow-up
+    query converts them to a native Neo4j Point3D list for spatial queries.
+    """
+    if not node_dicts:
+        logger.info("insert_nodes_to_db: no nodes to insert for layer %s", layer_label)
+        return
+    db.execute(
         f"""
-    WITH $objects AS objects
-    UNWIND objects AS object
-    WITH point({{x: object.pos_x, y: object.pos_y, z: object.pos_z}}) AS p3d, point({{x: object.bbox_x, y: object.bbox_y, z: object.bbox_z}}) AS bb3d, point({{x: object.bbox_l, y: object.bbox_w, z: object.bbox_h}}) AS bbdim,  object
-    MERGE (n:Object {{nodeSymbol: object.nodeSymbol}})
+        WITH $nodes AS nodes
+        UNWIND nodes AS node
+        WITH point({{x: node.pos_x, y: node.pos_y, z: node.pos_z}}) AS p3d, node
+        MERGE (n:{layer_label} {{nodeSymbol: node.nodeSymbol}})
+        SET n.center = p3d, n += node
+        """,
+        nodes=node_dicts,
+    )
+
+    # Convert flat bbox_x/y/z/l/w/h to Point3D bbox_center and bbox_dim.
+    # db_record_to_spark_attrs() expects these as Point3D for reconstruction.
+    has_bbox = any("bbox_x" in d for d in node_dicts)
+    if has_bbox:
+        db.execute(
+            f"""
+            MATCH (n:{layer_label})
+            WHERE n.bbox_x IS NOT NULL
+            SET n.bbox_center = point({{x: n.bbox_x, y: n.bbox_y, z: n.bbox_z}}),
+                n.bbox_dim = point({{x: n.bbox_l, y: n.bbox_w, z: n.bbox_h}})
+            REMOVE n.bbox_x, n.bbox_y, n.bbox_z, n.bbox_l, n.bbox_w, n.bbox_h
+            """
+        )
+
+    # Convert flat boundary_x/y/z lists to native Point3D list.
+    # This enables Neo4j spatial functions (point.distance, point.withinBBox)
+    # on boundary points in future queries.
+    has_boundary = any("boundary_x" in d for d in node_dicts)
+    if has_boundary:
+        db.execute(
+            f"""
+            MATCH (n:{layer_label})
+            WHERE n.boundary_x IS NOT NULL
+            WITH n, range(0, size(n.boundary_x)-1) AS indices
+            SET n.boundary = [i IN indices |
+                point({{x: n.boundary_x[i], y: n.boundary_y[i], z: n.boundary_z[i]}})]
+            REMOVE n.boundary_x, n.boundary_y, n.boundary_z
+            """
+        )
+
+
+# ---------------------------------------------------------------------------
+# Agent helpers
+# ---------------------------------------------------------------------------
+
+
+def agent_to_dict(agent):
+    attrs = agent.attributes
+    d = {}
+    d["nodeSymbol"] = agent.id.str(True)
+    d["pos_x"] = attrs.position[0]
+    d["pos_y"] = attrs.position[1]
+    d["pos_z"] = attrs.position[2]
+
+    if hasattr(attrs, "image_folder"):
+        d["image_folder"] = attrs.image_folder
+
+    return d
+
+
+def insert_agents_to_db(db, agents):
+    return db.execute(
+        f"""
+    WITH $agents AS agents
+    UNWIND agents AS agent
+    WITH point({{x: agent.pos_x, y: agent.pos_y, z: agent.pos_z}}) AS p3d, agent
+    MERGE (n:{constants.AGENTS} {{nodeSymbol: agent.nodeSymbol}})
     SET n.center = p3d,
-        n.bbox_center = bb3d,
-        n.bbox_dim = bbdim,
-        n.class = object.class,
-        n.name = object.name,
-        n.image_folder = object.image_folder,
-        n.details = object.details,
-        n.first_observed_ns = object.first_observed_ns,
-        n.last_observed_ns = object.last_observed_ns
+        n.image_folder = agent.image_folder
     """,
-        objects=objects,
+        agents=agents,
     )
 
 
-# Inserting places
-def place_to_dict(place):
-    attrs = place.attributes
-    d = {}
-    d["nodeSymbol"] = place.id.str(True)
-    d["x"] = attrs.position[0]
-    d["y"] = attrs.position[1]
-    d["z"] = attrs.position[2]
-    return d
+def add_agents_from_dsg(G, image_folder_root, db):
+    layer = G.get_layer(spark_dsg.DsgLayers.AGENTS)
+    if layer is None:
+        return
+
+    agents = []
+    for a in layer.nodes:
+        d = agent_to_dict(a)
+        if image_folder_root and "image_folder" in d and d["image_folder"]:
+            d["image_folder"] = os.path.join(
+                image_folder_root, os.path.basename(d["image_folder"])
+            )
+        agents.append(d)
+
+    if agents:
+        insert_agents_to_db(db, agents)
+
+
+# ---------------------------------------------------------------------------
+# Observation helpers
+# ---------------------------------------------------------------------------
+
+
+def insert_observations_to_db(db, observations):
+    return db.execute(
+        f"""
+    WITH $observations AS observations
+    UNWIND observations AS obs
+    MERGE (:{constants.OBSERVATIONS} {{
+        nodeSymbol: obs.nodeSymbol,
+        timestamp_ns: obs.timestamp_ns,
+        mask_file: obs.mask_file,
+        bbox_2d_min_x: obs.bbox_2d_min_x,
+        bbox_2d_min_y: obs.bbox_2d_min_y,
+        bbox_2d_max_x: obs.bbox_2d_max_x,
+        bbox_2d_max_y: obs.bbox_2d_max_y
+    }})
+    """,
+        observations=observations,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-layer wrappers (know which spark_dsg layer to iterate)
+# ---------------------------------------------------------------------------
+
+
+def add_objects_from_dsg(G, image_folder_root, db, object_labelspace=None):
+    """Insert Object nodes (and their Observation nodes) into Neo4j.
+
+    Parameters
+    ----------
+    G : spark_dsg.DynamicSceneGraph
+    image_folder_root : str or None
+        Root directory containing per-object image folders.  When provided,
+        each object's ``image_folder`` attribute is rebased onto this root
+        and ``*_meta.json`` files are read to create Observation nodes.
+    db : Neo4jWrapper
+    object_labelspace : dict or None
+        ``{str(int_id): class_name}`` mapping used by node_to_dict().
+    """
+    if object_labelspace is None:
+        object_labelspace = {}
+    nodes = [
+        node_to_dict(o, object_labelspace=object_labelspace)
+        for o in G.get_layer(spark_dsg.DsgLayers.OBJECTS).nodes
+    ]
+
+    # Rebase image_folder paths onto image_folder_root if provided.
+    if image_folder_root:
+        for d in nodes:
+            if d.get("image_folder"):
+                d["image_folder"] = os.path.join(
+                    image_folder_root, os.path.basename(d["image_folder"])
+                )
+
+    insert_nodes_to_db(db, constants.OBJECTS, nodes)
+
+    # Process observations from per-object image folders.
+    if image_folder_root:
+        observations = []
+        object_observation_edges = []
+
+        for obj in nodes:
+            image_folder = obj.get("image_folder")
+            if not image_folder:
+                continue
+
+            meta_files = glob.glob(os.path.join(image_folder, "*_meta.json"))
+            for meta_file in meta_files:
+                try:
+                    with open(meta_file, "r") as f:
+                        data = json.load(f)
+
+                    timestamp_ns = data.get("timestamp_ns")
+                    if timestamp_ns is None:
+                        continue
+
+                    obs_symbol = f"{obj['nodeSymbol']}_{timestamp_ns}"
+                    obs_dict = {
+                        "nodeSymbol": obs_symbol,
+                        "timestamp_ns": timestamp_ns,
+                        "mask_file": data.get("mask_file", ""),
+                    }
+
+                    if "bbox_2d" in data:
+                        bbox_2d = data["bbox_2d"]
+                        obs_dict["bbox_2d_min_x"] = bbox_2d.get("min_x")
+                        obs_dict["bbox_2d_min_y"] = bbox_2d.get("min_y")
+                        obs_dict["bbox_2d_max_x"] = bbox_2d.get("max_x")
+                        obs_dict["bbox_2d_max_y"] = bbox_2d.get("max_y")
+
+                    observations.append(obs_dict)
+                    object_observation_edges.append(
+                        {"from": obj["nodeSymbol"], "to": obs_symbol}
+                    )
+                except Exception as e:
+                    print(f"Failed to parse observation file {meta_file}: {e}")
+
+        if observations:
+            insert_observations_to_db(db, observations)
+            insert_edges(
+                db,
+                constants.HAS_OBSERVATION,
+                constants.OBJECTS,
+                constants.OBSERVATIONS,
+                object_observation_edges,
+            )
 
 
 def add_places_from_dsg(G, db):
-    places = [place_to_dict(p) for p in G.get_layer(spark_dsg.DsgLayers.PLACES).nodes]
-    insert_places_to_db(db, places)
+    nodes = [
+        node_to_dict(p) for p in G.get_layer(spark_dsg.DsgLayers.PLACES).nodes
+    ]
+    insert_nodes_to_db(db, constants.PLACES, nodes)
 
 
-def insert_places_to_db(db, places):
-    return db.execute(
-        f"""
-    WITH $places AS places
-    UNWIND places AS place
-    WITH point({{x: place.x, y: place.y, z: place.z}}) AS p3d, place
-    MERGE (:{constants.PLACES} {{nodeSymbol: place.nodeSymbol, center: p3d}})
-    """,
-        places=places,
-    )
-
-
-# Inserting mesh places
-
-
-def mesh_place_to_dict(node_classes, mesh_place):
-    attrs = mesh_place.attributes
-    d = {}
-    d["nodeSymbol"] = mesh_place.id.str(True)
-    d["x"] = attrs.position[0]
-    d["y"] = attrs.position[1]
-    d["z"] = attrs.position[2]
-    d["class"] = node_classes[str(attrs.semantic_label)]
-    return d
-
-
-def add_mesh_places_from_dsg(G, db):
+def add_mesh_places_from_dsg(G, db, object_labelspace=None):
     try:
         mesh_place_layer = G.get_layer(spark_dsg.DsgLayers.MESH_PLACES)
     except IndexError:
         mesh_place_layer = G.get_layer(20)
 
-    mesh_places = [
-        mesh_place_to_dict(G.metadata.get()["labelspace"], p)
+    if object_labelspace is None:
+        object_labelspace = {}
+    nodes = [
+        node_to_dict(p, object_labelspace=object_labelspace)
         for p in mesh_place_layer.nodes
     ]
-    insert_mesh_places_to_db(db, mesh_places)
+    insert_nodes_to_db(db, constants.MESH_PLACES, nodes)
 
 
-def insert_mesh_places_to_db(db, mesh_places):
-    return db.execute(
-        f"""
-    WITH $mesh_places AS places
-    UNWIND places AS place
-    WITH point({{x: place.x, y: place.y, z: place.z}}) AS p3d, place
-    MERGE (:{constants.MESH_PLACES} {{nodeSymbol: place.nodeSymbol, center: p3d, class: place.class}})
-    """,
-        mesh_places=mesh_places,
-    )
-
-
-# Inserting Rooms
-
-
-def add_rooms_from_dsg(G, db):
-    if "room_labelspace" in G.metadata.get():
-        labelspace = G.metadata.get()["room_labelspace"]
-    else:
-        labelspace = {"0": "Unknown"}
-
-    rooms = [
-        room_to_dict(labelspace, r)
+def add_rooms_from_dsg(G, db, room_labelspace=None):
+    if room_labelspace is None:
+        room_labelspace = {}
+    nodes = [
+        node_to_dict(r, room_labelspace=room_labelspace)
         for r in G.get_layer(spark_dsg.DsgLayers.ROOMS).nodes
     ]
-    insert_rooms_to_db(db, rooms)
-
-
-def room_to_dict(node_classes, room):
-    attrs = room.attributes
-    d = {}
-    d["nodeSymbol"] = room.id.str(True)
-    d["x"] = attrs.position[0]
-    d["y"] = attrs.position[1]
-    d["z"] = attrs.position[2]
-    d["class"] = node_classes[str(attrs.semantic_label)]
-    return d
-
-
-def insert_rooms_to_db(db, rooms):
-    return db.execute(
-        f"""
-    WITH $rooms AS rooms
-    UNWIND rooms AS room
-    WITH point({{x: room.x, y: room.y, z: room.z}}) AS p3d, room
-    MERGE (:{constants.ROOMS} {{nodeSymbol: room.nodeSymbol, center: p3d, class: room.class}})
-    """,
-        rooms=rooms,
-    )
-
-
-# Inserting Buildings
-
-
-def building_to_dict(building):
-    attrs = building.attributes
-    d = {}
-    d["nodeSymbol"] = building.id.str(True)
-    d["x"] = attrs.position[0]
-    d["y"] = attrs.position[1]
-    d["z"] = attrs.position[2]
-    return d
+    insert_nodes_to_db(db, constants.ROOMS, nodes)
 
 
 def add_buildings_from_dsg(G, db):
-    buildings = [
-        building_to_dict(p) for p in G.get_layer(spark_dsg.DsgLayers.BUILDINGS).nodes
+    nodes = [
+        node_to_dict(b) for b in G.get_layer(spark_dsg.DsgLayers.BUILDINGS).nodes
     ]
-    insert_buildings_to_db(db, buildings)
+    insert_nodes_to_db(db, constants.BUILDINGS, nodes)
 
 
-def insert_buildings_to_db(db, buildings):
-    return db.execute(
-        f"""
-    WITH $buildings AS buildings
-    UNWIND buildings AS building
-    WITH point({{x: building.x, y: building.y, z: building.z}}) AS p3d, building
-    MERGE (:{constants.BUILDINGS} {{nodeSymbol: building.nodeSymbol, center: p3d}})
-    """,
-        buildings=buildings,
-    )
+# ---------------------------------------------------------------------------
+# Top-level load: spark_dsg → Neo4j
+# ---------------------------------------------------------------------------
+
+
+def spark_dsg_to_db(G, db, source_file_path=None, image_folder_root=None):
+    """Load all nodes and edges from a spark_dsg graph into Neo4j.
+
+    Extracts labelspaces from DSG metadata (embedded ``"labelspaces"`` key)
+    and passes them to per-layer functions for semantic label → class name
+    mapping.
+
+    If ``source_file_path`` is provided, it is stored as a ``_GraphMetadata``
+    node so that downstream tools (e.g., SGET) can locate the original file
+    on disk for mesh data and other large assets not stored in Neo4j.
+
+    If ``image_folder_root`` is provided, per-object image folders are rebased
+    onto this root and Observation nodes are created from ``*_meta.json`` files.
+    """
+    from .utils import extract_labelspaces_from_dsg
+
+    object_ls, room_ls = extract_labelspaces_from_dsg(G)
+
+    add_agents_from_dsg(G, image_folder_root, db)
+    add_objects_from_dsg(G, image_folder_root, db, object_labelspace=object_ls)
+    add_places_from_dsg(G, db)
+    add_mesh_places_from_dsg(G, db, object_labelspace=object_ls)
+    add_rooms_from_dsg(G, db, room_labelspace=room_ls)
+    add_buildings_from_dsg(G, db)
+    add_edges_from_dsg(G, db)
+
+    # Store labelspaces in Neo4j so db_to_spark_dsg() can reconstruct
+    # without requiring external YAML files or function arguments.
+    if object_ls:
+        ids = [int(k) for k in object_ls.keys()]
+        names = list(object_ls.values())
+        db.execute(
+            "MERGE (m:_Labelspace {layer: 'object'}) "
+            "SET m.ids = $ids, m.names = $names",
+            ids=ids,
+            names=names,
+        )
+    if room_ls:
+        ids = [int(k) for k in room_ls.keys()]
+        names = list(room_ls.values())
+        db.execute(
+            "MERGE (m:_Labelspace {layer: 'room'}) "
+            "SET m.ids = $ids, m.names = $names",
+            ids=ids,
+            names=names,
+        )
+
+    if source_file_path is not None:
+        import os
+
+        abs_path = os.path.abspath(source_file_path)
+        db.execute(
+            "MERGE (m:_GraphMetadata {key: 'source'}) SET m.file_path = $path",
+            path=abs_path,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Edge insertion (unchanged — layer-aware, not type-aware)
+# ---------------------------------------------------------------------------
 
 
 def add_edges_from_dsg(G, db):
@@ -544,22 +765,20 @@ def insert_edges(db, edge_type, from_label, to_label, connections):
     return ret
 
 
+# ---------------------------------------------------------------------------
+# Generic node read (Neo4j → flat dict)
+# ---------------------------------------------------------------------------
+
+
 def get_layer_nodes(db, layer):
-    if layer == constants.OBJECTS:
-        records, summary, keys = db.execute(
-            f"""
-          Match (p:{layer})
-          RETURN p.nodeSymbol as nodeSymbol, p.class as class, p.center as center, p.bbox_center as bbox_center, p.bbox_dim as bbox_dim, p.name as name
-          """
-        )
-    else:
-        records, summary, keys = db.execute(
-            f"""
-          Match (p:{layer})
-          RETURN p.nodeSymbol as nodeSymbol, p.class as class, p.center as center
-          """
-        )
-    return records, summary, keys
+    """Fetch all nodes for a layer, returning all properties generically."""
+    records, summary, keys = db.execute(
+        f"""
+        MATCH (p:{layer})
+        RETURN properties(p) AS props
+        """
+    )
+    return [dict(r["props"]) for r in records], summary, keys
 
 
 def get_db_edges(db, edge_type, from_label, to_label):
@@ -569,6 +788,109 @@ def get_db_edges(db, edge_type, from_label, to_label):
     """
     records, summary, keys = db.execute(query)
     return records, summary, keys
+
+
+# ---------------------------------------------------------------------------
+# Generic reconstruction (Neo4j → spark_dsg)
+# ---------------------------------------------------------------------------
+
+
+def db_record_to_spark_attrs(record, object_labelspace, room_labelspace):
+    """Create a spark_dsg attribute object from a Neo4j property dict.
+
+    Uses ``attr_type`` (stored on the node) to pick the right C++ class.
+    Raises ValueError if attr_type is missing — the database must be
+    reloaded from the source JSON to populate it.
+    """
+    attr_type = record.get("attr_type")
+    if attr_type is None:
+        raise ValueError(
+            f"Node {record.get('nodeSymbol', '?')} has no attr_type property. "
+            f"This database may have been populated by an older version of heracles. "
+            f"Please reload the source JSON file to update the database."
+        )
+    cls = ATTR_TYPE_REGISTRY.get(attr_type, spark_dsg.NodeAttributes)
+    attrs = cls()
+
+    # Position (all nodes).
+    if "center" in record:
+        attrs.position = record["center"]
+
+    # Name (SemanticNodeAttributes).
+    if hasattr(attrs, "name") and "name" in record:
+        attrs.name = record["name"]
+
+    # Semantic label → class (SemanticNodeAttributes).
+    if hasattr(attrs, "semantic_label") and "class" in record:
+        ls = (
+            room_labelspace
+            if isinstance(attrs, spark_dsg.RoomNodeAttributes)
+            else object_labelspace
+        )
+        if record["class"] in ls:
+            attrs.semantic_label = ls[record["class"]]
+
+    # Color (SemanticNodeAttributes).
+    if hasattr(attrs, "color") and "color_r" in record:
+        import numpy as np
+
+        attrs.color = np.array(
+            [record["color_r"], record["color_g"], record["color_b"]], dtype=np.uint8
+        )
+
+    # Bounding box (ObjectNodeAttributes).
+    if hasattr(attrs, "bounding_box") and "bbox_dim" in record:
+        attrs.bounding_box = spark_dsg.BoundingBox(
+            [record["bbox_dim"][0], record["bbox_dim"][1], record["bbox_dim"][2]],
+            [
+                record["bbox_center"][0],
+                record["bbox_center"][1],
+                record["bbox_center"][2],
+            ],
+        )
+
+    # Registered flag (ObjectNodeAttributes).
+    if hasattr(attrs, "registered") and "registered" in record:
+        attrs.registered = bool(record["registered"])
+
+    # Distance (PlaceNodeAttributes).
+    if hasattr(attrs, "distance") and "distance" in record:
+        attrs.distance = float(record["distance"])
+
+    # Observation timestamps.
+    # KhronosObjectAttributes exposes these as read-only lists; standard types
+    # use a settable scalar. Try to set, skip gracefully if read-only.
+    for ts_field in ("first_observed_ns", "last_observed_ns"):
+        if hasattr(attrs, ts_field) and ts_field in record:
+            try:
+                setattr(attrs, ts_field, int(record[ts_field]))
+            except (AttributeError, TypeError):
+                pass  # Read-only on this attr type (e.g., KhronosObjectAttributes)
+
+    # TravNodeAttributes boundary.
+    if hasattr(attrs, "radii") and "radii" in record:
+        attrs.radii = [float(r) for r in record["radii"]]
+        if "states" in record:
+            # Convert ints back to TraversabilityState enums for the C++ binding.
+            attrs.states = [spark_dsg.TraversabilityState(int(s)) for s in record["states"]]
+        if "min_radius" in record:
+            attrs.min_radius = float(record["min_radius"])
+        if "max_radius" in record:
+            attrs.max_radius = float(record["max_radius"])
+
+    # Place2dNodeAttributes boundary (stored as Point3D list in Neo4j).
+    if hasattr(attrs, "boundary") and isinstance(getattr(attrs, "boundary", None), list):
+        if "boundary" in record and isinstance(record["boundary"], list):
+            import numpy as np
+
+            attrs.boundary = [
+                np.array([float(pt[0]), float(pt[1]), float(pt[2])])
+                for pt in record["boundary"]
+            ]
+
+    return attrs
+
+
 
 
 def insert_edges_to_spark(G, records):
@@ -592,147 +914,91 @@ def str_to_ns_value(string):
 
 def add_edges_from_db(db, G):
     #### INTRALAYER EDGES
-    # Add the Object-Object edges
     records, _, _ = get_db_edges(
         db, "OBJECT_CONNECTED", constants.OBJECTS, constants.OBJECTS
     )
     insert_edges_to_spark(G, records)
-    # Add the MeshPlace-MeshPlace edges
     records, _, _ = get_db_edges(
         db, "MESH_PLACE_CONNECTED", constants.MESH_PLACES, constants.MESH_PLACES
     )
     insert_edges_to_spark(G, records)
-    # Add the Place-Place edges
     records, _, _ = get_db_edges(
         db, "PLACE_CONNECTED", constants.PLACES, constants.PLACES
     )
     insert_edges_to_spark(G, records)
-    # Add the Room-Room edges
     records, _, _ = get_db_edges(db, "ROOM_CONNECTED", constants.ROOMS, constants.ROOMS)
     insert_edges_to_spark(G, records)
-    # Add the Building-Building edges
     records, _, _ = get_db_edges(
         db, "BUILDING_CONNECTED", constants.BUILDINGS, constants.BUILDINGS
     )
     insert_edges_to_spark(G, records)
 
     #### INTERLAYER EDGES
-    # Add the MeshPlace-Object edges
     records, _, _ = get_db_edges(
         db, "CONTAINS", constants.MESH_PLACES, constants.OBJECTS
     )
     insert_edges_to_spark(G, records)
-    # Add the Place-Object edges
     records, _, _ = get_db_edges(db, "CONTAINS", constants.PLACES, constants.OBJECTS)
     insert_edges_to_spark(G, records)
-    # Add the Room-Place edges
     records, _, _ = get_db_edges(db, "CONTAINS", constants.ROOMS, constants.PLACES)
     insert_edges_to_spark(G, records)
-    # Add the Room-Place edges
     records, _, _ = get_db_edges(db, "CONTAINS", constants.ROOMS, constants.MESH_PLACES)
     insert_edges_to_spark(G, records)
-    # Add the Building-Room edges
     records, _, _ = get_db_edges(db, "CONTAINS", constants.BUILDINGS, constants.ROOMS)
     insert_edges_to_spark(G, records)
     return
 
 
-def db_to_spark_mesh_place(mp, label_to_semantic_id):
-    attrs = spark_dsg.Place2dNodeAttributes()
-    attrs.name = mp["nodeSymbol"]
-    attrs.position = mp["center"]
-    attrs.semantic_label = label_to_semantic_id[mp["class"]]
-    return attrs
+_DEFAULT_LAYER_MAP = {
+    2: constants.OBJECTS,
+    3: constants.PLACES,
+    4: constants.ROOMS,
+    5: constants.BUILDINGS,
+    20: constants.MESH_PLACES,
+}
 
 
-def db_to_spark_place(p, label_to_semantic_id):
-    attrs = spark_dsg.PlaceNodeAttributes()
-    attrs.name = p["nodeSymbol"]
-    attrs.position = p["center"]
-    return attrs
-
-
-def db_to_spark_object(o, label_to_semantic_id):
-    attrs = spark_dsg.ObjectNodeAttributes()
-    attrs.name = o["nodeSymbol"]
-    attrs.position = o["center"]
-    
-    # Robust Label Lookup
-    cls_name = o["class"]
-    if cls_name in label_to_semantic_id:
-        attrs.semantic_label = label_to_semantic_id[cls_name]
-    else:
-        # Fallback to 0 if unknown, or try to find a generic one?
-        # Assuming 0 is valid or "Unknown"
-        # If we can't find it, we just set 0.
-        # Ideally we print a warning?
-        # print(f"Warning: Unknown class '{cls_name}', using default 0.")
-        attrs.semantic_label = 0
-        
-    attrs.name = o["name"]
-    # If name is empty, maybe use class?
-    if not attrs.name:
-         attrs.name = cls_name
-         
-    attrs.bounding_box = spark_dsg.BoundingBox(
-        [o["bbox_dim"][0], o["bbox_dim"][1], o["bbox_dim"][2]],  # dimensions
-        [o["bbox_center"][0], o["bbox_center"][1], o["bbox_center"][2]],  # center
+def _read_labelspace_from_db(db, layer_key):
+    """Read a labelspace from Neo4j's _Labelspace node. Returns {name: id}."""
+    records, _, _ = db.execute(
+        "MATCH (m:_Labelspace {layer: $layer}) RETURN m.ids AS ids, m.names AS names",
+        layer=layer_key,
     )
-    return attrs
+    if not records:
+        logger.warning("No _Labelspace node found for layer '%s' in Neo4j", layer_key)
+        return {}
+    ids = records[0]["ids"]
+    names = records[0]["names"]
+    return {name: sid for sid, name in zip(ids, names)}
 
 
-def db_to_spark_room(r, room_label_to_semantic_id):
-    attrs = spark_dsg.RoomNodeAttributes()
-    attrs.name = r["nodeSymbol"]
-    attrs.position = r["center"]
-    attrs.semantic_label = room_label_to_semantic_id[r["class"]]
-    attrs.bounding_box = spark_dsg.BoundingBox([0.1, 0.1, 0.1])
-    return attrs
+def db_to_spark_dsg(db):
+    """Reconstruct a spark_dsg DynamicSceneGraph from Neo4j.
 
+    Reads labelspaces from ``_Labelspace`` nodes in the database.
+    Uses ``attr_type`` stored on each node to create the correct attribute
+    class.
+    """
+    label_to_semantic_id = _read_labelspace_from_db(db, "object")
+    room_label_to_semantic_id = _read_labelspace_from_db(db, "room")
 
-def db_to_spark_dsg(
-    db, spark_layer_id_to_layer_name, label_to_semantic_id, room_label_to_semantic_id
-):
-    # Initialize the spark_dsg scene graph object
     new_scene_graph = spark_dsg.DynamicSceneGraph()
-    new_scene_graph.clear(True)  # Removes all layers
+    new_scene_graph.clear(True)
 
-    # -- Dynamic Label Expansion Logic --
-    # Hack: Pre-fetch objects to find unknown classes so we can add them to labelspace
-    # We iterate layers, if we match OBJECTS, we fetch records early.
-    
-    # We need to process layers in order or just find the Objects layer key
-    # spark_layer_id_to_layer_name maps generic ID to heracles string
-    # We look for constants.OBJECTS
-    
-    # Let's pre-scan objects
-    records_map = {} # Cache records to avoid repeated DB calls
-    
-    for spark_layer_id, heracles_layer_name in spark_layer_id_to_layer_name.items():
-        records, summary, keys = get_layer_nodes(db, heracles_layer_name)
-        # Consure iterator to list so we can iterate twice
-        records_list = list(records)
-        records_map[heracles_layer_name] = records_list
-        
-        if heracles_layer_name == constants.OBJECTS:
-            # Update label map
-            next_id = max(label_to_semantic_id.values()) + 1 if label_to_semantic_id else 1
-            
-            for rec in records_list:
-                c = rec["class"]
-                if c and c not in label_to_semantic_id:
-                    # Assign new ID
-                    label_to_semantic_id[c] = next_id
-                    print(f"Assigning new class '{c}' -> {next_id}")
-                    next_id += 1
+    # Write labelspaces so they persist in the exported DSG metadata.
+    if label_to_semantic_id:
+        object_labelspace = spark_dsg.Labelspace(
+            {v: k for k, v in label_to_semantic_id.items()}
+        )
+        new_scene_graph.set_labelspace(object_labelspace, 2, 0)
 
-    object_labelspace = spark_dsg.Labelspace(
-        {v: k for k, v in label_to_semantic_id.items()}
-    )
-    new_scene_graph.set_labelspace(object_labelspace, 2, 0)
-    
-    # Add each layer (LayerID, PythonPartitionID, Name)
-    for spark_layer_id, heracles_layer_name in spark_layer_id_to_layer_name.items():
+    if room_label_to_semantic_id:
+        room_labelspace = spark_dsg.Labelspace(
+            {v: k for k, v in room_label_to_semantic_id.items()}
+        )
+        new_scene_graph.set_labelspace(room_labelspace, 4, 0)
+
+    for spark_layer_id, heracles_layer_name in _DEFAULT_LAYER_MAP.items():
         if spark_layer_id == 20:
             new_scene_graph.add_layer(
                 3,
@@ -745,40 +1011,20 @@ def db_to_spark_dsg(
                 0,
                 constants.HERACLES_TO_SPARK_LAYER_NAMES[heracles_layer_name],
             )
-            
-        # Use cached records
-        records = records_map.get(heracles_layer_name, [])
-        # records, summary, keys = get_layer_nodes(db, heracles_layer_name) # OLD call
-        # Assign the function to get the attributes
-        # TODO - Can we have a generic function for retreiving all of the attributes?
-        attr_func = None
-        match heracles_layer_name:
-            case constants.MESH_PLACES:
-                attr_func = db_to_spark_mesh_place
-            case constants.PLACES:
-                attr_func = db_to_spark_place
-            case constants.OBJECTS:
-                attr_func = db_to_spark_object
-            case constants.ROOMS:
-                attr_func = db_to_spark_room
-            case constants.BUILDINGS:
-                # attr_func = db_to_spark_building
-                pass
-            case _:
-                raise ValueError(
-                    f'Unexpected heracles layer name "{heracles_layer_name}"'
-                )
+
+
+        records, summary, keys = get_layer_nodes(db, heracles_layer_name)
+
+
         for record in records:
-            attrs = []
-            if heracles_layer_name == constants.ROOMS:
-                attrs = attr_func(record, room_label_to_semantic_id)
-            else:
-                attrs = attr_func(record, label_to_semantic_id)
+            attrs = db_record_to_spark_attrs(
+                record, label_to_semantic_id, room_label_to_semantic_id
+            )
             new_scene_graph.add_node(
                 constants.HERACLES_TO_SPARK_LAYER_NAMES[heracles_layer_name],
                 str_to_ns_value(record["nodeSymbol"]),
                 attrs,
             )
-    # Add all of the edges
+
     add_edges_from_db(db, new_scene_graph)
     return new_scene_graph
