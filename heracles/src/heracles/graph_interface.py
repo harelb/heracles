@@ -942,12 +942,16 @@ def set_observation_embedding(db, observation_symbol: str, vec, model_name: str)
     set_node_embedding(db, observation_symbol, vec, model_name)
 
 
-def query_similar_nodes(db, label: str, query_vec, k: int = 10, filter_cypher: str | None = None):
+def query_similar_nodes(
+    db, label: str, query_vec, k: int = 10, filter_cypher: str | None = None
+) -> list[tuple[str, float]]:
     """Return list of (node_symbol, score) tuples for the top-k nodes most similar to query_vec.
 
     ``label`` is one of ``"Object"`` | ``"Observation"`` | ``"TrajectoryFrame"``.
     ``filter_cypher`` is an optional Cypher predicate fragment, e.g. ``"n.class = 'chair'"``,
-    inserted after the vector search as a ``WHERE`` clause.
+    inserted after the vector search as a ``WHERE`` clause. WARNING: this fragment is
+    interpolated directly into the query; callers must ensure it is not derived from
+    untrusted input (no user-controlled cypher).
     """
     index_name = {
         "Object": "object_embedding",
@@ -1022,7 +1026,10 @@ def insert_frame_edges(
 
 def bump_version(db) -> int:
     """Atomically increment ``_State {key:'global'}.version`` and return the new value.
-    Initial value is 0; first call returns 1.
+
+    The first call creates the node with ``version = 1`` and returns ``1``.
+    Subsequent calls increment and return the new value. ``read_version`` returns
+    ``0`` when the node does not yet exist (i.e. before the first bump).
     """
     records, _, _ = db.execute(
         "MERGE (s:_State {key: 'global'}) "
