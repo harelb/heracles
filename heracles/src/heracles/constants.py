@@ -11,6 +11,10 @@ OBSERVATIONS = "Observation"
 ROOMS = "Room"
 BUILDINGS = "Building"
 HAS_OBSERVATION = "HAS_OBSERVATION"
+TRAJECTORY_FRAMES = "TrajectoryFrame"
+STATE_NODE = "_State"
+OBSERVED_AT = "OBSERVED_AT"
+DEPICTS = "DEPICTS"
 
 # Mappings to/from heracles and spark_dsg
 SPARK_TO_HERACLES_LAYER_NAMES = MappingProxyType(

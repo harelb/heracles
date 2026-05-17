@@ -893,6 +893,154 @@ def db_record_to_spark_attrs(record, object_labelspace, room_labelspace):
 
 
 
+# ---------------------------------------------------------------------------
+# Embedding + versioning helpers (T3)
+# ---------------------------------------------------------------------------
+
+
+def create_vector_indexes(db, dim: int, model_name: str) -> None:
+    """Create Neo4j vector indices on Object/Observation/TrajectoryFrame.embedding properties.
+
+    Idempotent: uses ``CREATE VECTOR INDEX ... IF NOT EXISTS``.
+
+    The index name is derived from the node label: ``object_embedding``,
+    ``observation_embedding``, ``trajectoryframe_embedding``.
+    Cosine similarity, dimension = ``dim``.
+    """
+    for label, index_name in [
+        ("Object", "object_embedding"),
+        ("Observation", "observation_embedding"),
+        ("TrajectoryFrame", "trajectoryframe_embedding"),
+    ]:
+        cypher = (
+            f"CREATE VECTOR INDEX {index_name} IF NOT EXISTS "
+            f"FOR (n:{label}) ON (n.embedding) "
+            f"OPTIONS {{indexConfig: {{`vector.dimensions`: $dim, `vector.similarity_function`: 'cosine'}}}}"
+        )
+        db.execute(cypher, dim=dim)
+
+
+def set_node_embedding(db, node_symbol: str, vec, model_name: str) -> None:
+    """Set the ``embedding``, ``embedding_dim``, ``embedding_model`` properties on a node
+    identified by ``nodeSymbol``. ``vec`` is a list[float] or 1D numpy array.
+    """
+    vec_list = list(map(float, vec))
+    db.execute(
+        "MATCH (n {nodeSymbol: $ns}) SET n.embedding = $v, n.embedding_dim = $d, n.embedding_model = $m",
+        ns=node_symbol,
+        v=vec_list,
+        d=len(vec_list),
+        m=model_name,
+    )
+
+
+def set_observation_embedding(db, observation_symbol: str, vec, model_name: str) -> None:
+    """Same as set_node_embedding but scoped to Observation nodes by their ``nodeSymbol``.
+
+    Observations are identified by ``nodeSymbol`` (see ``insert_observations_to_db``).
+    """
+    set_node_embedding(db, observation_symbol, vec, model_name)
+
+
+def query_similar_nodes(db, label: str, query_vec, k: int = 10, filter_cypher: str | None = None):
+    """Return list of (node_symbol, score) tuples for the top-k nodes most similar to query_vec.
+
+    ``label`` is one of ``"Object"`` | ``"Observation"`` | ``"TrajectoryFrame"``.
+    ``filter_cypher`` is an optional Cypher predicate fragment, e.g. ``"n.class = 'chair'"``,
+    inserted after the vector search as a ``WHERE`` clause.
+    """
+    index_name = {
+        "Object": "object_embedding",
+        "Observation": "observation_embedding",
+        "TrajectoryFrame": "trajectoryframe_embedding",
+    }[label]
+    where = f"WHERE {filter_cypher} " if filter_cypher else ""
+    cypher = (
+        f"CALL db.index.vector.queryNodes('{index_name}', $k, $v) YIELD node, score "
+        f"{where}"
+        f"RETURN node.nodeSymbol AS ns, score ORDER BY score DESC"
+    )
+    vec_list = list(map(float, query_vec))
+    records, _, _ = db.execute(cypher, k=k, v=vec_list)
+    return [(r["ns"], r["score"]) for r in records]
+
+
+def insert_trajectory_frames_to_db(db, frames: list) -> int:
+    """Insert TrajectoryFrame nodes. Each frame dict has keys:
+      nodeSymbol, timestamp_ns, path, pos_x, pos_y, pos_z,
+      pose_qw, pose_qx, pose_qy, pose_qz, place_id (str|None),
+      embedding (list[float]|None), embedding_dim (int|None), embedding_model (str|None).
+
+    Uses MERGE on nodeSymbol so the operation is idempotent. Sets ``center = point(...)``.
+    Returns the number of rows actually written.
+    """
+    if not frames:
+        return 0
+    cypher = """
+    UNWIND $frames AS f
+    MERGE (t:TrajectoryFrame {nodeSymbol: f.nodeSymbol})
+    SET t.timestamp_ns = f.timestamp_ns,
+        t.path = f.path,
+        t.pos_x = f.pos_x, t.pos_y = f.pos_y, t.pos_z = f.pos_z,
+        t.pose_qw = f.pose_qw, t.pose_qx = f.pose_qx, t.pose_qy = f.pose_qy, t.pose_qz = f.pose_qz,
+        t.place_id = f.place_id,
+        t.center = point({x: f.pos_x, y: f.pos_y, z: f.pos_z}),
+        t.embedding = f.embedding,
+        t.embedding_dim = f.embedding_dim,
+        t.embedding_model = f.embedding_model
+    RETURN count(t) AS n
+    """
+    records, _, _ = db.execute(cypher, frames=frames)
+    return records[0]["n"] if records else 0
+
+
+def insert_frame_edges(
+    db,
+    frame_to_place_edges: list,
+    frame_to_object_edges: list,
+) -> None:
+    """Create OBSERVED_AT edges from TrajectoryFrame to Place and DEPICTS edges from
+    TrajectoryFrame to Object.
+
+    Each tuple is (frame_symbol, target_symbol). MERGE-based so idempotent.
+    """
+    if frame_to_place_edges:
+        db.execute(
+            "UNWIND $pairs AS p "
+            "MATCH (f:TrajectoryFrame {nodeSymbol: p[0]}), (place {nodeSymbol: p[1]}) "
+            "MERGE (f)-[:OBSERVED_AT]->(place)",
+            pairs=[list(t) for t in frame_to_place_edges],
+        )
+    if frame_to_object_edges:
+        db.execute(
+            "UNWIND $pairs AS p "
+            "MATCH (f:TrajectoryFrame {nodeSymbol: p[0]}), (obj:Object {nodeSymbol: p[1]}) "
+            "MERGE (f)-[:DEPICTS]->(obj)",
+            pairs=[list(t) for t in frame_to_object_edges],
+        )
+
+
+def bump_version(db) -> int:
+    """Atomically increment ``_State {key:'global'}.version`` and return the new value.
+    Initial value is 0; first call returns 1.
+    """
+    records, _, _ = db.execute(
+        "MERGE (s:_State {key: 'global'}) "
+        "ON CREATE SET s.version = 1 "
+        "ON MATCH SET s.version = s.version + 1 "
+        "RETURN s.version AS v"
+    )
+    return records[0]["v"] if records else 0
+
+
+def read_version(db) -> int:
+    """Return the current ``_State.version`` (0 if the node doesn't exist yet)."""
+    records, _, _ = db.execute(
+        "MATCH (s:_State {key: 'global'}) RETURN s.version AS v"
+    )
+    return records[0]["v"] if records else 0
+
+
 def insert_edges_to_spark(G, records):
     for record in records:
         G.insert_edge(str_to_ns_value(record["from"]), str_to_ns_value(record["to"]))
