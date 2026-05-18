@@ -611,7 +611,27 @@ def spark_dsg_to_db(G, db, source_file_path=None, image_folder_root=None):
 
 def add_edges_from_dsg(G, db):
     print("Adding Edges")
-    layer_id_to_layer_str = G.metadata.get()["LayerIdToHeraclesLayerStr"]
+    meta = G.metadata.get() or {}
+    if "LayerIdToHeraclesLayerStr" in meta:
+        layer_id_to_layer_str = meta["LayerIdToHeraclesLayerStr"]
+    else:
+        # Build fallback: map both "N" (integer form, from .layer.layer) and
+        # "N[P]" (full LayerKey form, from .layer) to heracles layer strings.
+        _dsg_to_heracles = [
+            ("OBJECTS", constants.OBJECTS),
+            ("PLACES", constants.PLACES),
+            ("MESH_PLACES", constants.MESH_PLACES),
+            ("ROOMS", constants.ROOMS),
+            ("BUILDINGS", constants.BUILDINGS),
+            ("AGENTS", constants.AGENTS),
+        ]
+        layer_id_to_layer_str = {}
+        for dsg_name, heracles_name in _dsg_to_heracles:
+            lk = spark_dsg.DsgLayers.name_to_layer_id(dsg_name)
+            if lk is not None:
+                # setdefault so earlier entries (OBJECTS before AGENTS) win
+                layer_id_to_layer_str.setdefault(str(lk), heracles_name)
+                layer_id_to_layer_str.setdefault(str(lk.layer), heracles_name)
 
     object_object_edges = []
     for n in G.get_layer(spark_dsg.DsgLayers.OBJECTS).nodes:
