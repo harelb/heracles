@@ -397,19 +397,20 @@ def add_agents_from_dsg(G, image_folder_root, db):
 
 
 def insert_observations_to_db(db, observations):
+    # MERGE on nodeSymbol only, then SET the rest — so re-observing the same
+    # (object, keyframe) updates in place instead of creating a duplicate node
+    # whenever the 2D bbox / mask differs slightly between queries.
     return db.execute(
         f"""
     WITH $observations AS observations
     UNWIND observations AS obs
-    MERGE (:{constants.OBSERVATIONS} {{
-        nodeSymbol: obs.nodeSymbol,
-        timestamp_ns: obs.timestamp_ns,
-        mask_file: obs.mask_file,
-        bbox_2d_min_x: obs.bbox_2d_min_x,
-        bbox_2d_min_y: obs.bbox_2d_min_y,
-        bbox_2d_max_x: obs.bbox_2d_max_x,
-        bbox_2d_max_y: obs.bbox_2d_max_y
-    }})
+    MERGE (o:{constants.OBSERVATIONS} {{nodeSymbol: obs.nodeSymbol}})
+    SET o.timestamp_ns = obs.timestamp_ns,
+        o.mask_file = obs.mask_file,
+        o.bbox_2d_min_x = obs.bbox_2d_min_x,
+        o.bbox_2d_min_y = obs.bbox_2d_min_y,
+        o.bbox_2d_max_x = obs.bbox_2d_max_x,
+        o.bbox_2d_max_y = obs.bbox_2d_max_y
     """,
         observations=observations,
     )
@@ -774,12 +775,14 @@ def add_edges_from_dsg(G, db):
 
 
 def insert_edges(db, edge_type, from_label, to_label, connections):
+    # MERGE (not CREATE) so re-inserting the same edge is idempotent — CREATE made
+    # re-runs (e.g. re-querying SAM3) accumulate duplicate parallel relationships.
     query = f"""
     WITH $connections AS connections
     UNWIND connections AS connection
     MATCH (n1: {from_label} {{nodeSymbol: connection.from}})
     MATCH (n2: {to_label} {{nodeSymbol: connection.to}})
-    CREATE (n1)-[:{edge_type}]->(n2)
+    MERGE (n1)-[:{edge_type}]->(n2)
     """
     ret = db.execute(query, connections=connections)
     return ret
