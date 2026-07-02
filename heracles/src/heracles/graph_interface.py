@@ -463,6 +463,8 @@ def merge_agent_image_folders(G, db):
     UNWIND agents AS agent
     MERGE (n:{constants.AGENTS} {{nodeSymbol: agent.nodeSymbol}})
     ON CREATE SET n.center = point({{x: agent.pos_x, y: agent.pos_y, z: agent.pos_z}}),
+                  n.rot_w = agent.rot_w, n.rot_x = agent.rot_x,
+                  n.rot_y = agent.rot_y, n.rot_z = agent.rot_z,
                   n.image_folder = agent.image_folder
     ON MATCH SET n.image_folder = agent.image_folder
     """,
