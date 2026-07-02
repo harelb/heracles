@@ -107,6 +107,16 @@ def build_test_dsg():
         spark_dsg.NodeSymbol("P", 0).value, spark_dsg.NodeSymbol("P", 1).value
     )
 
+    agent_attrs = spark_dsg.AgentNodeAttributes()
+    agent_attrs.position = [4.0, 5.0, 6.0]
+    agent_attrs.world_R_body = spark_dsg.Quaternion(0.5, 0.5, 0.5, 0.5)
+    agent_attrs.image_folder = "agent_777"
+    # Agents must live in a NON-ZERO partition keyed by the 'a' prefix
+    # (ord('a')==97). The string-layer add_node overload always inserts at
+    # partition 0, which _collect_keyframe_agents deliberately skips — so use
+    # the (layer_id:int, node_id, attrs, partition:int) overload explicitly.
+    G.add_node(2, spark_dsg.NodeSymbol("a", 0), agent_attrs, ord("a"))
+
     return G
 
 
@@ -191,6 +201,9 @@ def populated_db():
         add_buildings_from_dsg(G, db)
         add_edges_from_dsg(G, db)
 
+        from heracles.graph_interface import add_agents_from_dsg
+        add_agents_from_dsg(G, temp_dir, db)
+
         yield db
     
     # db.close() # Clean up at end if needed, but yield handles it usually. 
@@ -260,3 +273,19 @@ def test_edges(populated_db):
     assert len(q) == 2
     assert q[0]["o"]["class"] in ["box", "rock"]
     assert q[1]["o"]["class"] in ["box", "rock"]
+
+
+def test_agents(populated_db):
+    q = populated_db.query(
+        """MATCH (a:Agent {nodeSymbol: "a0"})
+           RETURN a.center AS center, a.rot_w AS rw, a.rot_x AS rx,
+                  a.rot_y AS ry, a.rot_z AS rz, a.image_folder AS img"""
+    )
+    assert len(q) == 1
+    row = q[0]
+    assert np.all(np.isclose(row["center"], np.array([4.0, 5.0, 6.0])))
+    assert np.isclose(row["rw"], 0.5)
+    assert np.isclose(row["rx"], 0.5)
+    assert np.isclose(row["ry"], 0.5)
+    assert np.isclose(row["rz"], 0.5)
+    assert row["img"] == "agent_777"

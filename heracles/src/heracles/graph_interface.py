@@ -375,6 +375,10 @@ def insert_agents_to_db(db, agents):
     WITH point({{x: agent.pos_x, y: agent.pos_y, z: agent.pos_z}}) AS p3d, agent
     MERGE (n:{constants.AGENTS} {{nodeSymbol: agent.nodeSymbol}})
     SET n.center = p3d,
+        n.rot_w = agent.rot_w,
+        n.rot_x = agent.rot_x,
+        n.rot_y = agent.rot_y,
+        n.rot_z = agent.rot_z,
         n.image_folder = agent.image_folder
     """,
         agents=agents,
