@@ -143,10 +143,16 @@ class TestOldDsgRoundtrip:
         sample = nodes[0]
         assert "class" in sample
         assert "center" in sample
-        assert "bbox_x" in sample
+        # insert_nodes_to_db converts flat bbox_x/y/z/l/w/h to native Point3D
+        # bbox_center / bbox_dim and removes the flat keys.
+        assert "bbox_center" in sample
+        assert "bbox_dim" in sample
         assert sample["attr_type"] == "ObjectNodeAttributes"
         assert "color_r" in sample
         assert "registered" in sample
+        # New schema additions (Phase 0.5): explicit layer/partition ints.
+        assert sample.get("layer") == 2
+        assert sample.get("partition") == 0
 
     def test_room_properties_preserved(self, db):
         """Room nodes preserve class and position."""
@@ -253,3 +259,126 @@ class TestAttrTypeRequired:
 
         with pytest.raises(ValueError, match="no attr_type"):
             db_record_to_spark_attrs(records[0], {}, {})
+
+
+# ---------------------------------------------------------------------------
+# Agent-partition selection (no live Neo4j required — uses a capturing fake db)
+# ---------------------------------------------------------------------------
+
+
+class _CaptureDB:
+    """Minimal db stub: records the ``agents`` kwarg passed to db.execute()."""
+
+    def __init__(self):
+        self.captured_agents = None
+
+    def execute(self, query, **params):
+        if "agents" in params:
+            self.captured_agents = params["agents"]
+        return ([], None, None)
+
+
+def _build_object_and_agent_graph():
+    """A DSG with one Object (layer 2, partition 0) and one Agent (layer 2,
+    partition ord('a')). Both share layer id 2 — agents are distinguished only
+    by partition, which is the crux of the bug under test."""
+    G = spark_dsg.DynamicSceneGraph()
+    G.add_layer(2, 0, spark_dsg.DsgLayers.OBJECTS)
+    G.add_layer(2, ord("a"), spark_dsg.DsgLayers.AGENTS)
+
+    obj = spark_dsg.KhronosObjectAttributes()
+    obj.position = np.array([1.0, 2.0, 3.0])
+    obj.image_folder = "/crops/O5"
+    G.add_node(2, spark_dsg.NodeSymbol("O", 5).value, obj, 0)
+
+    agent = spark_dsg.AgentNodeAttributes()
+    agent.position = np.array([10.0, 20.0, 30.0])
+    agent.image_folder = "/abs/agents/agent_123"
+    G.add_node(2, spark_dsg.NodeSymbol("a", 0).value, agent, ord("a"))
+    return G
+
+
+class TestAgentPartition:
+    """add_agents_from_dsg must read the agent partition (layer 2, partition
+    != 0), NOT G.get_layer(DsgLayers.AGENTS) which resolves to layer 2 /
+    partition 0 == the OBJECTS layer."""
+
+    def test_agents_read_from_correct_partition(self):
+        from heracles.graph_interface import add_agents_from_dsg
+
+        G = _build_object_and_agent_graph()
+        cap = _CaptureDB()
+        # image_folder_root is the OBJECT-crop dir; agents must NOT be rebased onto it.
+        add_agents_from_dsg(G, "/crops", cap)
+
+        assert cap.captured_agents is not None, "no agents were written"
+        syms = [a["nodeSymbol"] for a in cap.captured_agents]
+        # Exactly the real agent; the object O5 must NOT be written as an Agent.
+        assert syms == ["a0"], f"expected only the agent a0, got {syms}"
+
+    def test_agent_image_folder_not_rebased(self):
+        from heracles.graph_interface import add_agents_from_dsg
+
+        G = _build_object_and_agent_graph()
+        cap = _CaptureDB()
+        add_agents_from_dsg(G, "/crops", cap)
+
+        agent = cap.captured_agents[0]
+        # The agent's image_folder is already an absolute agents/ prefix; it must
+        # be preserved verbatim, not joined onto the object-crop root.
+        assert agent["image_folder"] == "/abs/agents/agent_123"
+
+    def test_object_not_mislabeled_as_agent(self):
+        from heracles.graph_interface import add_agents_from_dsg
+
+        G = _build_object_and_agent_graph()
+        cap = _CaptureDB()
+        add_agents_from_dsg(G, "/crops", cap)
+
+        syms = [a["nodeSymbol"] for a in (cap.captured_agents or [])]
+        assert "O5" not in syms, "object O5 was mislabeled as an Agent"
+
+
+def _build_frontend_like_graph(folders):
+    """A DSG with agent nodes a0..a{N-1}, each with the given image_folder (or '')."""
+    G = spark_dsg.DynamicSceneGraph()
+    G.add_layer(2, ord("a"), spark_dsg.DsgLayers.AGENTS)
+    for i, folder in enumerate(folders):
+        a = spark_dsg.AgentNodeAttributes()
+        a.position = np.array([float(i), 0.0, 0.0])
+        a.image_folder = folder
+        G.add_node(2, spark_dsg.NodeSymbol("a", i).value, a, ord("a"))
+    return G
+
+
+class TestMergeAgentImageFolders:
+    """merge_agent_image_folders upserts image_folder by symbol (no rebasing),
+    so backend agent nodes that lost image_folder during pose-graph optimization
+    can be filled from the sibling frontend DSG."""
+
+    def test_merges_all_nonempty_folders(self):
+        from heracles.graph_interface import merge_agent_image_folders
+
+        # frontend-like: a0,a1,a2 all have folders (backend would have dropped a1).
+        G = _build_frontend_like_graph(["/agents/agent_0", "/agents/agent_1", "/agents/agent_2"])
+        cap = _CaptureDB()
+        n = merge_agent_image_folders(G, cap)
+
+        assert n == 3
+        rows = {a["nodeSymbol"]: a["image_folder"] for a in cap.captured_agents}
+        assert rows == {
+            "a0": "/agents/agent_0",
+            "a1": "/agents/agent_1",
+            "a2": "/agents/agent_2",
+        }
+
+    def test_skips_empty_folders(self):
+        from heracles.graph_interface import merge_agent_image_folders
+
+        G = _build_frontend_like_graph(["/agents/agent_0", "", "/agents/agent_2"])
+        cap = _CaptureDB()
+        n = merge_agent_image_folders(G, cap)
+
+        assert n == 2
+        syms = {a["nodeSymbol"] for a in cap.captured_agents}
+        assert syms == {"a0", "a2"}

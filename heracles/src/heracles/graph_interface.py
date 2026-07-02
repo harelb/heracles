@@ -141,6 +141,15 @@ def node_to_dict(node, object_labelspace=None, room_labelspace=None):
         "pos_z": float(attrs.position[2]),
     }
 
+    # Explicit layer/partition ints so the renderer can group/Z-offset without
+    # inferring them from the node label. (node.layer is a LayerKey.)
+    try:
+        lk = node.layer
+        d["layer"] = int(getattr(lk, "layer", lk))
+        d["partition"] = int(getattr(lk, "partition", 0))
+    except Exception:
+        pass
+
     # SemanticNodeAttributes fields (optional).
     if hasattr(attrs, "semantic_label"):
         ls = (
@@ -182,6 +191,22 @@ def node_to_dict(node, object_labelspace=None, room_labelspace=None):
                 d["bbox_l"] = float(bb.dimensions[0])
                 d["bbox_w"] = float(bb.dimensions[1])
                 d["bbox_h"] = float(bb.dimensions[2])
+                # Oriented box: store rotation as a quaternion (w,x,y,z) so the
+                # renderer can orient the box. Axis-aligned boxes (has_rotation
+                # False) stay implicit-identity to keep the row small.
+                try:
+                    if bb.has_rotation():
+                        import numpy as _np
+                        import trimesh.transformations as _tt
+                        _M = _np.eye(4)
+                        _M[:3, :3] = _np.array(bb.world_R_center)
+                        _q = _tt.quaternion_from_matrix(_M)  # [w, x, y, z]
+                        d["bbox_qw"] = float(_q[0])
+                        d["bbox_qx"] = float(_q[1])
+                        d["bbox_qy"] = float(_q[2])
+                        d["bbox_qz"] = float(_q[3])
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning(
                 "Node %s: failed to read bounding_box: %s",
@@ -385,22 +410,90 @@ def insert_agents_to_db(db, agents):
     )
 
 
-def add_agents_from_dsg(G, image_folder_root, db):
-    layer = G.get_layer(spark_dsg.DsgLayers.AGENTS)
-    if layer is None:
-        return
+def _collect_keyframe_agents(G):
+    """Return agent dicts (with a non-empty image_folder) from every keyframe
+    partition of the agents layer.
 
+    Agents share layer id 2 with OBJECTS but live in a non-zero partition (robot
+    prefix 'a' -> ord('a')). ``G.get_layer(DsgLayers.AGENTS)`` resolves to layer 2 /
+    partition 0 == the OBJECTS layer, so it must NOT be used here — iterating it
+    mislabels Objects as Agents. Enumerate the partitions instead and read agents
+    from every non-zero partition (handles multi-robot prefixes), guarded by an
+    AgentNodeAttributes type check. Agents with an empty image_folder (no extracted
+    keyframe) are skipped.
+    """
+    agents_layer = spark_dsg.DsgLayers.name_to_layer_id("AGENTS").layer  # == 2
     agents = []
-    for a in layer.nodes:
-        d = agent_to_dict(a)
-        if image_folder_root and "image_folder" in d and d["image_folder"]:
-            d["image_folder"] = os.path.join(
-                image_folder_root, os.path.basename(d["image_folder"])
-            )
-        agents.append(d)
+    for key in G.layer_keys:
+        if key.layer != agents_layer or key.partition == 0:
+            continue
+        for a in G.get_layer(key.layer, key.partition).nodes:
+            if not isinstance(a.attributes, spark_dsg.AgentNodeAttributes):
+                continue
+            d = agent_to_dict(a)
+            # Agent image_folder is already the absolute on-disk agents/ prefix;
+            # do NOT rebase it onto image_folder_root (the object-crop dir).
+            if d.get("image_folder"):
+                agents.append(d)
+    return agents
 
+
+def add_agents_from_dsg(G, image_folder_root, db):
+    agents = _collect_keyframe_agents(G)
     if agents:
         insert_agents_to_db(db, agents)
+
+
+def merge_agent_image_folders(G, db):
+    """Upsert ``image_folder`` onto Agent nodes by nodeSymbol from G (no rebasing).
+
+    Hydra's backend pose-graph optimization drops ``image_folder`` on roughly half
+    the agent (keyframe) nodes; the sibling *frontend* DSG retains all of them. This
+    merges the frontend folders in by symbol so every keyframe is queryable, WITHOUT
+    disturbing the optimized ``center`` already written for existing backend nodes
+    (only newly-created frontend-only nodes get their center set). Returns the number
+    of agent rows upserted.
+    """
+    agents = _collect_keyframe_agents(G)
+    if not agents:
+        return 0
+    db.execute(
+        f"""
+    WITH $agents AS agents
+    UNWIND agents AS agent
+    MERGE (n:{constants.AGENTS} {{nodeSymbol: agent.nodeSymbol}})
+    ON CREATE SET n.center = point({{x: agent.pos_x, y: agent.pos_y, z: agent.pos_z}}),
+                  n.image_folder = agent.image_folder
+    ON MATCH SET n.image_folder = agent.image_folder
+    """,
+        agents=agents,
+    )
+    return len(agents)
+
+
+def _merge_agent_folders_from_frontend_sibling(db, source_file_path):
+    """Best-effort: if loading a hydra *backend* DSG, fill agent image_folders the
+    backend dropped from the sibling ``../frontend/dsg.json`` (see
+    :func:`merge_agent_image_folders`). No-op if the path is not a backend DSG or the
+    frontend sibling is absent.
+    """
+    if not source_file_path:
+        return 0
+    src = os.path.abspath(source_file_path)
+    parent = os.path.dirname(src)
+    if os.path.basename(parent) != "backend":
+        return 0
+    frontend = os.path.join(os.path.dirname(parent), "frontend", "dsg.json")
+    if not os.path.exists(frontend):
+        return 0
+    try:
+        G_fe = spark_dsg.DynamicSceneGraph.load(frontend)
+    except Exception:
+        logger.exception("could not load frontend DSG %s for agent merge", frontend)
+        return 0
+    n = merge_agent_image_folders(G_fe, db)
+    logger.info("merged %d agent image_folders from frontend DSG %s", n, frontend)
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -560,7 +653,7 @@ def add_buildings_from_dsg(G, db):
 # ---------------------------------------------------------------------------
 
 
-def spark_dsg_to_db(G, db, source_file_path=None, image_folder_root=None):
+def spark_dsg_to_db(G, db, source_file_path=None, image_folder_root=None, mesh_path=None):
     """Load all nodes and edges from a spark_dsg graph into Neo4j.
 
     Extracts labelspaces from DSG metadata (embedded ``"labelspaces"`` key)
@@ -579,6 +672,10 @@ def spark_dsg_to_db(G, db, source_file_path=None, image_folder_root=None):
     object_ls, room_ls = extract_labelspaces_from_dsg(G)
 
     add_agents_from_dsg(G, image_folder_root, db)
+    # Backend DSGs lose agent image_folder on ~half the keyframe nodes during
+    # pose-graph optimization; recover them from the sibling frontend DSG so all
+    # keyframes are queryable. Best-effort, keyed off the backend source path.
+    _merge_agent_folders_from_frontend_sibling(db, source_file_path)
     add_objects_from_dsg(G, image_folder_root, db, object_labelspace=object_ls)
     add_places_from_dsg(G, db)
     add_mesh_places_from_dsg(G, db, object_labelspace=object_ls)
@@ -615,6 +712,110 @@ def spark_dsg_to_db(G, db, source_file_path=None, image_folder_root=None):
             "MERGE (m:_GraphMetadata {key: 'source'}) SET m.file_path = $path",
             path=abs_path,
         )
+
+    if mesh_path is not None:
+        store_mesh_path(db, mesh_path)
+
+
+# ---------------------------------------------------------------------------
+# Mesh path (geometry lives on disk, not in Neo4j — store a pointer to the .ply)
+# ---------------------------------------------------------------------------
+
+
+def store_mesh_path(db, mesh_path, mesh_format=None):
+    """Record the scene mesh file location so the renderer can load it directly
+    (e.g. ``trimesh.load(path)``) without going through spark_dsg.
+
+    Stored on a ``_GraphMetadata {key:'mesh'}`` node as ``file_path``/``format``.
+    """
+    import os
+
+    abs_path = os.path.abspath(str(mesh_path))
+    fmt = mesh_format or os.path.splitext(abs_path)[1].lstrip(".").lower() or "ply"
+    db.execute(
+        "MERGE (m:_GraphMetadata {key: 'mesh'}) SET m.file_path = $path, m.format = $fmt",
+        path=abs_path,
+        fmt=fmt,
+    )
+
+
+def read_mesh_path(db):
+    """Return ``(file_path, format)`` for the scene mesh, or ``(None, None)``."""
+    records, _, _ = db.execute(
+        "MATCH (m:_GraphMetadata {key: 'mesh'}) RETURN m.file_path AS p, m.format AS f"
+    )
+    if records:
+        return records[0]["p"], records[0]["f"]
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# Incremental writes (write only a changeset — for the online ingester and
+# single mutations; the full-graph spark_dsg_to_db re-writes everything).
+# ---------------------------------------------------------------------------
+
+# (layer, partition) -> heracles node label.
+_LAYER_PARTITION_TO_LABEL = {
+    (2, 0): constants.OBJECTS,
+    (3, 0): constants.PLACES,
+    (3, 1): constants.MESH_PLACES,
+    (4, 0): constants.ROOMS,
+    (5, 0): constants.BUILDINGS,
+}
+
+
+def update_db_from_spark_dsg(
+    G, db, node_ids, object_labelspace=None, room_labelspace=None, bump=True
+):
+    """Write only ``node_ids`` (symbol strings) from G into Neo4j (idempotent MERGE).
+
+    Incremental counterpart to :func:`spark_dsg_to_db`. Groups the ids by layer
+    label and bulk-MERGEs each group. Ids not present in G are skipped (handle
+    deletions via :func:`remove_nodes`). Returns the new ``_State.version`` if
+    ``bump`` (so callers can fan out a GraphEvent).
+    """
+    if object_labelspace is None or room_labelspace is None:
+        try:
+            from .utils import extract_labelspaces_from_dsg
+            o_ls, r_ls = extract_labelspaces_from_dsg(G)
+            object_labelspace = object_labelspace or o_ls
+            room_labelspace = room_labelspace or r_ls
+        except Exception:
+            pass
+
+    by_label: dict[str, list] = {}
+    for nid in node_ids:
+        try:
+            node = G.get_node(str_to_ns_value(nid))
+        except Exception:
+            continue
+        if node is None:
+            continue
+        key = (int(node.layer.layer), int(node.layer.partition))
+        label = _LAYER_PARTITION_TO_LABEL.get(key)
+        if label is None:
+            continue
+        d = node_to_dict(
+            node, object_labelspace=object_labelspace, room_labelspace=room_labelspace
+        )
+        by_label.setdefault(label, []).append(d)
+
+    for label, dicts in by_label.items():
+        insert_nodes_to_db(db, label, dicts)
+
+    return bump_version(db) if bump else read_version(db)
+
+
+def remove_nodes(db, node_ids, bump=True):
+    """Detach-delete ``node_ids`` (symbol strings). Returns new version if ``bump``."""
+    ids = list(node_ids)
+    if not ids:
+        return read_version(db)
+    db.execute(
+        "UNWIND $ids AS ns MATCH (n {nodeSymbol: ns}) DETACH DELETE n",
+        ids=ids,
+    )
+    return bump_version(db) if bump else read_version(db)
 
 
 # ---------------------------------------------------------------------------
@@ -1081,6 +1282,41 @@ def read_version(db) -> int:
         "MATCH (s:_State {key: 'global'}) RETURN s.version AS v"
     )
     return records[0]["v"] if records else 0
+
+
+def record_change(db, dirty_layers=None, affected_ids=None) -> int:
+    """Bump the version AND record which layers/ids changed on ``_State``.
+
+    Lets a cross-process reader (e.g. viz_agent's SyncSupervisor) re-render only
+    the dirty layers instead of the whole graph. ``dirty_layers`` is a list of
+    ``"layer:partition"`` strings. Returns the new version.
+    """
+    records, _, _ = db.execute(
+        "MERGE (s:_State {key: 'global'}) "
+        "ON CREATE SET s.version = 1 "
+        "ON MATCH SET s.version = s.version + 1 "
+        "SET s.dirty_layers = $dl, s.affected_ids = $ai "
+        "RETURN s.version AS v",
+        dl=list(dirty_layers or []),
+        ai=list(affected_ids or []),
+    )
+    return records[0]["v"] if records else 0
+
+
+def read_change(db):
+    """Return ``(version, dirty_layers, affected_ids)`` from ``_State``.
+
+    ``dirty_layers`` is a list of ``"layer:partition"`` strings (empty if the
+    last write didn't record any — treat that as "re-render everything").
+    """
+    records, _, _ = db.execute(
+        "MATCH (s:_State {key: 'global'}) "
+        "RETURN s.version AS v, s.dirty_layers AS dl, s.affected_ids AS ai"
+    )
+    if not records:
+        return 0, [], []
+    r = records[0]
+    return r["v"] or 0, list(r["dl"] or []), list(r["ai"] or [])
 
 
 def insert_edges_to_spark(G, records):
