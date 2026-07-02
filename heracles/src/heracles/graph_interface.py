@@ -353,6 +353,14 @@ def agent_to_dict(agent):
     d["pos_y"] = attrs.position[1]
     d["pos_z"] = attrs.position[2]
 
+    # Orientation from the DSG attribute (optimized in place by backend PGO).
+    # The baked _meta.json world_T_body is a stale snapshot and is not used.
+    rot = attrs.world_R_body
+    d["rot_w"] = rot.w
+    d["rot_x"] = rot.x
+    d["rot_y"] = rot.y
+    d["rot_z"] = rot.z
+
     if hasattr(attrs, "image_folder"):
         d["image_folder"] = attrs.image_folder
 
