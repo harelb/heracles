@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import neo4j
+import numpy as np
 import parse
 import spark_dsg
 
@@ -389,6 +390,36 @@ def agent_to_dict(agent):
     if hasattr(attrs, "image_folder"):
         d["image_folder"] = attrs.image_folder
 
+    return d
+
+
+def subkeyframe_to_dict(subframe, anchor_pose):
+    """anchor_pose = (world_t_anchor (3,), world_R_anchor (w,x,y,z))."""
+    from heracles.pose_math import compose_pose
+
+    attrs = subframe.attributes
+    anchor_R = attrs.anchor_R_subframe
+    world_t, world_R = compose_pose(
+        world_t_anchor=anchor_pose[0],
+        world_R_anchor=anchor_pose[1],
+        anchor_t_sub=np.array(attrs.anchor_t_subframe),
+        anchor_R_sub=(anchor_R.w, anchor_R.x, anchor_R.y, anchor_R.z),
+    )
+    d = {
+        "nodeSymbol": subframe.id.str(True),
+        "anchor_symbol": spark_dsg.NodeSymbol(attrs.anchor_node_id).str(True),
+        "pos_x": float(world_t[0]),
+        "pos_y": float(world_t[1]),
+        "pos_z": float(world_t[2]),
+        "rot_w": float(world_R[0]),
+        "rot_x": float(world_R[1]),
+        "rot_y": float(world_R[2]),
+        "rot_z": float(world_R[3]),
+        "image_folder": attrs.image_folder,
+        # NOTE: the python binding exposes `timestamp` as datetime.timedelta
+        # (chrono caster), NOT an int. Convert to integer nanoseconds:
+        "timestamp_ns": round(attrs.timestamp.total_seconds() * 1e9),
+    }
     return d
 
 
