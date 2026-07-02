@@ -475,6 +475,53 @@ def add_agents_from_dsg(G, image_folder_root, db):
         insert_agents_to_db(db, agents)
 
 
+def _collect_subkeyframes(G):
+    """Sub-keyframes share layer 2 with agents/objects but use the 's' prefix
+    partition. Filter by attribute type; compose world pose from each node's
+    anchor agent node (optimized pose = source of truth)."""
+    sub_layer = spark_dsg.DsgLayers.name_to_layer_id("AGENTS").layer  # == 2
+    out = []
+    for key in G.layer_keys:
+        if key.layer != sub_layer or key.partition == 0:
+            continue
+        for n in G.get_layer(key.layer, key.partition).nodes:
+            if not isinstance(n.attributes, spark_dsg.SubKeyframeNodeAttributes):
+                continue
+            anchor_id = n.attributes.anchor_node_id
+            if not G.has_node(anchor_id):
+                continue  # anchor pruned; skip (orphan)
+            a = G.get_node(anchor_id).attributes
+            aR = a.world_R_body
+            anchor_pose = (np.array(a.position), (aR.w, aR.x, aR.y, aR.z))
+            out.append(subkeyframe_to_dict(n, anchor_pose))
+    return out
+
+
+def insert_subkeyframes_to_db(db, subframes):
+    return db.execute(
+        f"""
+    WITH $subframes AS subframes
+    UNWIND subframes AS s
+    MERGE (n:{constants.SUBKEYFRAMES} {{nodeSymbol: s.nodeSymbol}})
+    SET n.center = point({{x: s.pos_x, y: s.pos_y, z: s.pos_z}}),
+        n.rot_w = s.rot_w, n.rot_x = s.rot_x, n.rot_y = s.rot_y, n.rot_z = s.rot_z,
+        n.image_folder = s.image_folder,
+        n.timestamp_ns = s.timestamp_ns
+    """,
+        subframes=subframes,
+    )
+
+
+def add_subkeyframes_from_dsg(G, db):
+    subframes = _collect_subkeyframes(G)
+    if not subframes:
+        return 0
+    insert_subkeyframes_to_db(db, subframes)
+    edges = [{"from": s["nodeSymbol"], "to": s["anchor_symbol"]} for s in subframes]
+    insert_edges(db, constants.ANCHORED_TO, constants.SUBKEYFRAMES, constants.AGENTS, edges)
+    return len(subframes)
+
+
 def merge_agent_image_folders(G, db):
     """Upsert ``image_folder`` onto Agent nodes by nodeSymbol from G (no rebasing).
 
@@ -714,6 +761,7 @@ def spark_dsg_to_db(G, db, source_file_path=None, image_folder_root=None, mesh_p
     add_mesh_places_from_dsg(G, db, object_labelspace=object_ls)
     add_rooms_from_dsg(G, db, room_labelspace=room_ls)
     add_buildings_from_dsg(G, db)
+    add_subkeyframes_from_dsg(G, db)
     add_edges_from_dsg(G, db)
 
     # Store labelspaces in Neo4j so db_to_spark_dsg() can reconstruct
