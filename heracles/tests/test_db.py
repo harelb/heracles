@@ -1,13 +1,16 @@
-from importlib.resources import as_file, files
+import datetime
+import json
+import os
+import tempfile
+from unittest.mock import patch
+
 
 import neo4j
 import numpy as np
 import pytest
 import spark_dsg
-import yaml
 
 import heracles
-import heracles.resources
 from heracles.graph_interface import (
     add_buildings_from_dsg,
     add_edges_from_dsg,
@@ -15,6 +18,7 @@ from heracles.graph_interface import (
     add_objects_from_dsg,
     add_places_from_dsg,
     add_rooms_from_dsg,
+    obj_to_dict,
 )
 from heracles.query_interface import Neo4jWrapper
 
@@ -27,13 +31,10 @@ def try_drop_index(db, index_name):
 
 
 def add_dsg_metadata(G):
-    with as_file(
-        files(heracles.resources).joinpath("ade20k_mit_label_space.yaml")
-    ) as path:
-        with open(str(path), "r") as fo:
-            labelspace = yaml.safe_load(fo)
-    id_to_label = {item["label"]: item["name"] for item in labelspace["label_names"]}
-    G.metadata.add({"labelspace": id_to_label})
+    # Inject a minimal labelspace using spark_dsg's native API.
+    # spark_dsg_to_db() extracts these via extract_labelspaces_from_dsg().
+    obj_ls = spark_dsg.Labelspace({0: "unknown", 1: "tree", 2: "box"})
+    G.set_labelspace(obj_ls, 2, 0)
 
     layers = {
         2: "Object",
@@ -107,6 +108,42 @@ def build_test_dsg():
         spark_dsg.NodeSymbol("P", 0).value, spark_dsg.NodeSymbol("P", 1).value
     )
 
+    agent_attrs = spark_dsg.AgentNodeAttributes()
+    agent_attrs.position = [4.0, 5.0, 6.0]
+    agent_attrs.world_R_body = spark_dsg.Quaternion(0.5, 0.5, 0.5, 0.5)
+    agent_attrs.image_folder = "agent_777"
+    # Agents must live in a NON-ZERO partition keyed by the 'a' prefix
+    # (ord('a')==97). The string-layer add_node overload always inserts at
+    # partition 0, which _collect_keyframe_agents deliberately skips — so use
+    # the (layer_id:int, node_id, attrs, partition:int) overload explicitly.
+    G.add_node(2, spark_dsg.NodeSymbol("a", 0), agent_attrs, ord("a"))
+
+    # Second agent, used purely as a sub-keyframe anchor. It MUST have an
+    # identity world_R_body (unlike a0, which Phase 1 gave a non-identity
+    # rotation (0.5,0.5,0.5,0.5)) so the composed sub-keyframe world position
+    # below is a simple translation and the test's expected value stays clean.
+    anchor_attrs = spark_dsg.AgentNodeAttributes()
+    anchor_attrs.position = [4.0, 5.0, 6.0]
+    anchor_attrs.world_R_body = spark_dsg.Quaternion(1.0, 0.0, 0.0, 0.0)
+    anchor_attrs.image_folder = "agent_888"
+    G.add_node(2, spark_dsg.NodeSymbol("a", 1), anchor_attrs, ord("a"))
+
+    sub_attrs = spark_dsg.SubKeyframeNodeAttributes()
+    sub_attrs.position = [0.0, 0.0, 0.0]  # seed; heracles recomputes from anchor
+    sub_attrs.anchor_node_id = spark_dsg.NodeSymbol("a", 1).value
+    sub_attrs.anchor_t_subframe = [0.5, 0.0, 0.0]
+    sub_attrs.anchor_R_subframe = spark_dsg.Quaternion(1.0, 0.0, 0.0, 0.0)
+    sub_attrs.image_folder = "subkf_777"
+    # NOTE: attrs.timestamp is bound as a chrono duration -> python exposes it
+    # as datetime.timedelta (NOT an int); assigning a bare int fails.
+    sub_attrs.timestamp = datetime.timedelta(microseconds=999)
+    G.add_node(
+        2,
+        spark_dsg.NodeSymbol("s", 0),
+        sub_attrs,
+        ord("s"),
+    )
+
     return G
 
 
@@ -154,17 +191,73 @@ def populated_db():
     CREATE INDEX room_node_symbol FOR (n:Room) ON (n.nodeSymbol)
     """
     )
+    
+    # Create temp dir for images
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Create dummy image folder for object "o0"
+        obj_folder = os.path.join(temp_dir, "O_0")
+        os.makedirs(obj_folder, exist_ok=True)
+        
+        # Create dummy meta file
+        meta_data = {
+            "timestamp_ns": 123456789,
+            "mask_file": "frame_1_mask.png",
+            "bbox_2d": {
+                "min_x": 10, "min_y": 20, "max_x": 100, "max_y": 200
+            }
+        }
+        with open(os.path.join(obj_folder, "frame_1_meta.json"), 'w') as f:
+            json.dump(meta_data, f)
+            
+        # Custom obj_to_dict wrapper to inject image_folder
+        original_obj_to_dict = obj_to_dict
+        def mock_obj_to_dict(node_classes, obj):
+            d = original_obj_to_dict(node_classes, obj)
+            # Inject image_folder for o0 to point to our temp folder name (basename)
+            if d["nodeSymbol"] == "o0":
+                d["image_folder"] = "O_0"
+            return d
 
-    add_objects_from_dsg(G, db)
-    add_places_from_dsg(G, db)
-    add_mesh_places_from_dsg(G, db)
-    add_rooms_from_dsg(G, db)
-    add_buildings_from_dsg(G, db)
-    add_edges_from_dsg(G, db)
+        with patch("heracles.graph_interface.obj_to_dict", side_effect=mock_obj_to_dict):
+            # We pass temp_dir as image_folder_root
+            add_objects_from_dsg(G, temp_dir, db)
+            
+        add_places_from_dsg(G, db)
+        add_mesh_places_from_dsg(G, db)
+        add_rooms_from_dsg(G, db)
+        add_buildings_from_dsg(G, db)
+        add_edges_from_dsg(G, db)
 
-    yield db
+        from heracles.graph_interface import add_agents_from_dsg
+        add_agents_from_dsg(G, temp_dir, db)
 
+        from heracles.graph_interface import add_subkeyframes_from_dsg
+        add_subkeyframes_from_dsg(G, db)
+
+        yield db
+    
+    # db.close() # Clean up at end if needed, but yield handles it usually. 
+    # The original code closed it after yield.
     db.close()
+
+
+def test_observations(populated_db):
+    # Verify Observation created
+    q = populated_db.query(
+        """MATCH (obs:Observation) RETURN obs"""
+    )
+    assert len(q) == 1
+    obs = q[0]["obs"]
+    assert obs["timestamp_ns"] == 123456789
+    assert obs["mask_file"] == "frame_1_mask.png"
+    assert obs["bbox_2d_min_x"] == 10
+    
+    # Verify connection to object
+    q = populated_db.query(
+        """MATCH (o:Object {nodeSymbol: "o0"})-[:HAS_OBSERVATION]->(obs:Observation) RETURN obs"""
+    )
+    assert len(q) == 1
+    assert q[0]["obs"]["nodeSymbol"] == "o0_123456789"
 
 
 def test_rooms(populated_db):
@@ -210,3 +303,40 @@ def test_edges(populated_db):
     assert len(q) == 2
     assert q[0]["o"]["class"] in ["box", "rock"]
     assert q[1]["o"]["class"] in ["box", "rock"]
+
+
+def test_agents(populated_db):
+    q = populated_db.query(
+        """MATCH (a:Agent {nodeSymbol: "a0"})
+           RETURN a.center AS center, a.rot_w AS rw, a.rot_x AS rx,
+                  a.rot_y AS ry, a.rot_z AS rz, a.image_folder AS img"""
+    )
+    assert len(q) == 1
+    row = q[0]
+    assert np.all(np.isclose(row["center"], np.array([4.0, 5.0, 6.0])))
+    assert np.isclose(row["rw"], 0.5)
+    assert np.isclose(row["rx"], 0.5)
+    assert np.isclose(row["ry"], 0.5)
+    assert np.isclose(row["rz"], 0.5)
+    assert row["img"] == "agent_777"
+
+
+def test_subkeyframes(populated_db):
+    # anchor is a1 ([4,5,6], identity rotation) + relative offset [0.5,0,0]
+    # -> composed world center = [4.5, 5, 6].
+    q = populated_db.query(
+        """MATCH (s:SubKeyframe {nodeSymbol: "s0"})
+           RETURN s.center AS center, s.timestamp_ns AS ts, s.image_folder AS img"""
+    )
+    assert len(q) == 1
+    assert np.all(np.isclose(q[0]["center"], np.array([4.5, 5.0, 6.0])))
+    # sub_attrs.timestamp = timedelta(microseconds=999) -> 999 * 1000 ns.
+    assert q[0]["ts"] == 999000
+    assert q[0]["img"] == "subkf_777"
+
+    # ANCHORED_TO edge to the anchor agent (a1, NOT a0 -- see build_test_dsg).
+    q2 = populated_db.query(
+        """MATCH (s:SubKeyframe {nodeSymbol:"s0"})-[:ANCHORED_TO]->(a:Agent {nodeSymbol:"a1"})
+           RETURN a.nodeSymbol AS ns"""
+    )
+    assert len(q2) == 1 and q2[0]["ns"] == "a1"
