@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import tempfile
@@ -117,6 +118,32 @@ def build_test_dsg():
     # the (layer_id:int, node_id, attrs, partition:int) overload explicitly.
     G.add_node(2, spark_dsg.NodeSymbol("a", 0), agent_attrs, ord("a"))
 
+    # Second agent, used purely as a sub-keyframe anchor. It MUST have an
+    # identity world_R_body (unlike a0, which Phase 1 gave a non-identity
+    # rotation (0.5,0.5,0.5,0.5)) so the composed sub-keyframe world position
+    # below is a simple translation and the test's expected value stays clean.
+    anchor_attrs = spark_dsg.AgentNodeAttributes()
+    anchor_attrs.position = [4.0, 5.0, 6.0]
+    anchor_attrs.world_R_body = spark_dsg.Quaternion(1.0, 0.0, 0.0, 0.0)
+    anchor_attrs.image_folder = "agent_888"
+    G.add_node(2, spark_dsg.NodeSymbol("a", 1), anchor_attrs, ord("a"))
+
+    sub_attrs = spark_dsg.SubKeyframeNodeAttributes()
+    sub_attrs.position = [0.0, 0.0, 0.0]  # seed; heracles recomputes from anchor
+    sub_attrs.anchor_node_id = spark_dsg.NodeSymbol("a", 1).value
+    sub_attrs.anchor_t_subframe = [0.5, 0.0, 0.0]
+    sub_attrs.anchor_R_subframe = spark_dsg.Quaternion(1.0, 0.0, 0.0, 0.0)
+    sub_attrs.image_folder = "subkf_777"
+    # NOTE: attrs.timestamp is bound as a chrono duration -> python exposes it
+    # as datetime.timedelta (NOT an int); assigning a bare int fails.
+    sub_attrs.timestamp = datetime.timedelta(microseconds=999)
+    G.add_node(
+        2,
+        spark_dsg.NodeSymbol("s", 0),
+        sub_attrs,
+        ord("s"),
+    )
+
     return G
 
 
@@ -204,6 +231,9 @@ def populated_db():
         from heracles.graph_interface import add_agents_from_dsg
         add_agents_from_dsg(G, temp_dir, db)
 
+        from heracles.graph_interface import add_subkeyframes_from_dsg
+        add_subkeyframes_from_dsg(G, db)
+
         yield db
     
     # db.close() # Clean up at end if needed, but yield handles it usually. 
@@ -289,3 +319,24 @@ def test_agents(populated_db):
     assert np.isclose(row["ry"], 0.5)
     assert np.isclose(row["rz"], 0.5)
     assert row["img"] == "agent_777"
+
+
+def test_subkeyframes(populated_db):
+    # anchor is a1 ([4,5,6], identity rotation) + relative offset [0.5,0,0]
+    # -> composed world center = [4.5, 5, 6].
+    q = populated_db.query(
+        """MATCH (s:SubKeyframe {nodeSymbol: "s0"})
+           RETURN s.center AS center, s.timestamp_ns AS ts, s.image_folder AS img"""
+    )
+    assert len(q) == 1
+    assert np.all(np.isclose(q[0]["center"], np.array([4.5, 5.0, 6.0])))
+    # sub_attrs.timestamp = timedelta(microseconds=999) -> 999 * 1000 ns.
+    assert q[0]["ts"] == 999000
+    assert q[0]["img"] == "subkf_777"
+
+    # ANCHORED_TO edge to the anchor agent (a1, NOT a0 -- see build_test_dsg).
+    q2 = populated_db.query(
+        """MATCH (s:SubKeyframe {nodeSymbol:"s0"})-[:ANCHORED_TO]->(a:Agent {nodeSymbol:"a1"})
+           RETURN a.nodeSymbol AS ns"""
+    )
+    assert len(q2) == 1 and q2[0]["ns"] == "a1"
