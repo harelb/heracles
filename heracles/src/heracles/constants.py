@@ -17,6 +17,9 @@ OBSERVED_AT = "OBSERVED_AT"
 DEPICTS = "DEPICTS"
 SUBKEYFRAMES = "SubKeyframe"
 ANCHORED_TO = "ANCHORED_TO"
+CAMERA_CALIBS = "CameraCalib"
+HAS_CALIB = "HAS_CALIB"
+OBSERVED_IN = "OBSERVED_IN"
 
 # Mappings to/from heracles and spark_dsg
 SPARK_TO_HERACLES_LAYER_NAMES = MappingProxyType(

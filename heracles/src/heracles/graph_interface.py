@@ -371,6 +371,19 @@ def insert_nodes_to_db(db, layer_label, node_dicts):
 # ---------------------------------------------------------------------------
 
 
+def _timestamp_from_agent_folder(image_folder):
+    """Parse the keyframe timestamp from an ``.../agent_<ts>`` file prefix.
+
+    Returns int nanoseconds or None. The suffix is the authoritative capture
+    timestamp baked in by hydra's AgentImageExtractor, so it can stand in for
+    graphs whose agent attributes carry no timestamp.
+    """
+    if not image_folder:
+        return None
+    tail = os.path.basename(str(image_folder)).rsplit("_", 1)[-1]
+    return int(tail) if tail.isdigit() else None
+
+
 def agent_to_dict(agent):
     attrs = agent.attributes
     d = {}
@@ -389,6 +402,19 @@ def agent_to_dict(agent):
 
     if hasattr(attrs, "image_folder"):
         d["image_folder"] = attrs.image_folder
+
+    # The python binding exposes `timestamp` as datetime.timedelta (chrono
+    # caster) and DEFAULTS to timedelta(0) when unset — treat 0 as unset and
+    # fall back to the agent_<ts> folder suffix so Observation nodes can be
+    # joined to their source keyframe in Cypher.
+    ts = getattr(attrs, "timestamp", None)
+    ts_ns = round(ts.total_seconds() * 1e9) if ts is not None else 0
+    if ts_ns > 0:
+        d["timestamp_ns"] = ts_ns
+    else:
+        parsed = _timestamp_from_agent_folder(d.get("image_folder"))
+        if parsed is not None:
+            d["timestamp_ns"] = parsed
 
     return d
 
@@ -435,7 +461,8 @@ def insert_agents_to_db(db, agents):
         n.rot_x = agent.rot_x,
         n.rot_y = agent.rot_y,
         n.rot_z = agent.rot_z,
-        n.image_folder = agent.image_folder
+        n.image_folder = agent.image_folder,
+        n.timestamp_ns = coalesce(agent.timestamp_ns, n.timestamp_ns)
     """,
         agents=agents,
     )
@@ -543,8 +570,10 @@ def merge_agent_image_folders(G, db):
     ON CREATE SET n.center = point({{x: agent.pos_x, y: agent.pos_y, z: agent.pos_z}}),
                   n.rot_w = agent.rot_w, n.rot_x = agent.rot_x,
                   n.rot_y = agent.rot_y, n.rot_z = agent.rot_z,
-                  n.image_folder = agent.image_folder
-    ON MATCH SET n.image_folder = agent.image_folder
+                  n.image_folder = agent.image_folder,
+                  n.timestamp_ns = agent.timestamp_ns
+    ON MATCH SET n.image_folder = agent.image_folder,
+                 n.timestamp_ns = coalesce(n.timestamp_ns, agent.timestamp_ns)
     """,
         agents=agents,
     )
@@ -595,10 +624,181 @@ def insert_observations_to_db(db, observations):
         o.bbox_2d_min_x = obs.bbox_2d_min_x,
         o.bbox_2d_min_y = obs.bbox_2d_min_y,
         o.bbox_2d_max_x = obs.bbox_2d_max_x,
-        o.bbox_2d_max_y = obs.bbox_2d_max_y
+        o.bbox_2d_max_y = obs.bbox_2d_max_y,
+        o.score = coalesce(obs.score, o.score),
+        o.detector = coalesce(obs.detector, o.detector),
+        o.mechanism = coalesce(obs.mechanism, o.mechanism)
     """,
         observations=observations,
     )
+
+
+# ---------------------------------------------------------------------------
+# Evidence provenance: Observation -> source frame, frame -> camera calibration
+# ---------------------------------------------------------------------------
+
+# Frame-bearing labels an Observation can be joined to by capture timestamp.
+_FRAME_LABELS = (constants.AGENTS, constants.SUBKEYFRAMES, constants.TRAJECTORY_FRAMES)
+
+
+def ensure_provenance_indexes(db):
+    """Idempotent b-tree indexes backing the timestamp joins below."""
+    for label in _FRAME_LABELS + (constants.OBSERVATIONS,):
+        db.execute(
+            f"CREATE INDEX {label.lower()}_timestamp_ns IF NOT EXISTS "
+            f"FOR (n:{label}) ON (n.timestamp_ns)"
+        )
+    db.execute(
+        f"CREATE INDEX {constants.CAMERA_CALIBS.lower()}_calib_id IF NOT EXISTS "
+        f"FOR (n:{constants.CAMERA_CALIBS}) ON (n.calib_id)"
+    )
+
+
+def link_observations_to_frames(db):
+    """MERGE ``(:Observation)-[:OBSERVED_IN]->(frame)`` by exact capture timestamp.
+
+    Observation symbols are ``<objectSymbol>_<timestamp_ns>`` where the timestamp
+    is the source keyframe's — so an equality join on ``timestamp_ns`` against
+    Agent / SubKeyframe / TrajectoryFrame recovers the missing provenance hop.
+    Best-effort: frames without a matching timestamp simply get no edge.
+    Returns the total number of edges present after the merge.
+    """
+    ensure_provenance_indexes(db)
+    total = 0
+    for label in _FRAME_LABELS:
+        records, _, _ = db.execute(
+            f"""
+        MATCH (o:{constants.OBSERVATIONS}) WHERE o.timestamp_ns IS NOT NULL
+        MATCH (f:{label} {{timestamp_ns: o.timestamp_ns}})
+        MERGE (o)-[:{constants.OBSERVED_IN}]->(f)
+        RETURN count(*) AS n
+        """
+        )
+        total += records[0]["n"] if records else 0
+    return total
+
+
+def backfill_agent_timestamps(db):
+    """Parse ``timestamp_ns`` from the ``agent_<ts>`` image_folder suffix for
+    Agent nodes that lack it (pre-existing databases). Returns rows updated."""
+    records, _, _ = db.execute(
+        f"""
+    MATCH (n:{constants.AGENTS})
+    WHERE n.timestamp_ns IS NULL AND n.image_folder IS NOT NULL
+    RETURN n.nodeSymbol AS ns, n.image_folder AS folder
+    """
+    )
+    updates = []
+    for r in records:
+        ts = _timestamp_from_agent_folder(r["folder"])
+        if ts is not None:
+            updates.append({"ns": r["ns"], "ts": ts})
+    if updates:
+        db.execute(
+            f"""
+        UNWIND $updates AS u
+        MATCH (n:{constants.AGENTS} {{nodeSymbol: u.ns}})
+        SET n.timestamp_ns = u.ts
+        """,
+            updates=updates,
+        )
+    return len(updates)
+
+
+def _load_calib_dict(calib_path):
+    """Read a hydra ``camera_calib.json`` into a flat CameraCalib property dict.
+
+    ``calib_id`` is a content hash so identical calibrations (multi-run maps)
+    collapse onto one node.
+    """
+    import hashlib
+
+    with open(calib_path, "r") as f:
+        data = json.load(f)
+    body_T_sensor = list(np.asarray(data["body_T_sensor"], dtype=float).reshape(-1))
+    d = {
+        "fx": float(data["fx"]),
+        "fy": float(data["fy"]),
+        "cx": float(data["cx"]),
+        "cy": float(data["cy"]),
+        "width": int(data["width"]),
+        "height": int(data["height"]),
+        "depth_scale": float(data.get("depth_scale", 1e-3)),
+        "body_T_sensor": body_T_sensor,
+    }
+    canonical = json.dumps(d, sort_keys=True)
+    d["calib_id"] = hashlib.sha256(canonical.encode()).hexdigest()[:16]
+    return d
+
+
+def attach_camera_calibs(db):
+    """Materialize ``(:CameraCalib)`` nodes + ``HAS_CALIB`` edges from on-disk
+    ``camera_calib.json`` files.
+
+    Agent/SubKeyframe ``image_folder`` values are file *prefixes* and
+    TrajectoryFrame ``path`` values are RGB files; the calibration sits once in
+    each parent directory. Missing/unreadable files are skipped (best-effort) —
+    frustum/visibility reasoning is only possible for frames that get an edge.
+    Returns the number of frame->calib edges written.
+    """
+    ensure_provenance_indexes(db)
+    label_prop = [
+        (constants.AGENTS, "image_folder"),
+        (constants.SUBKEYFRAMES, "image_folder"),
+        (constants.TRAJECTORY_FRAMES, "path"),
+    ]
+    calib_by_dir = {}
+    pairs_by_label = {}
+    for label, prop in label_prop:
+        records, _, _ = db.execute(
+            f"MATCH (n:{label}) WHERE n.{prop} IS NOT NULL "
+            f"RETURN n.nodeSymbol AS ns, n.{prop} AS p"
+        )
+        pairs = []
+        for r in records:
+            parent = os.path.dirname(str(r["p"]))
+            if parent not in calib_by_dir:
+                calib_path = os.path.join(parent, "camera_calib.json")
+                calib = None
+                if os.path.exists(calib_path):
+                    try:
+                        calib = _load_calib_dict(calib_path)
+                    except Exception:
+                        logger.exception("unreadable camera calib %s", calib_path)
+                calib_by_dir[parent] = calib
+            calib = calib_by_dir[parent]
+            if calib is not None:
+                pairs.append({"ns": r["ns"], "calib_id": calib["calib_id"]})
+        if pairs:
+            pairs_by_label[label] = pairs
+
+    # Calib nodes must exist before the MATCH-based edge merge below.
+    calibs = {c["calib_id"]: c for c in calib_by_dir.values() if c is not None}
+    if calibs:
+        db.execute(
+            f"""
+        UNWIND $calibs AS c
+        MERGE (n:{constants.CAMERA_CALIBS} {{calib_id: c.calib_id}})
+        SET n.fx = c.fx, n.fy = c.fy, n.cx = c.cx, n.cy = c.cy,
+            n.width = c.width, n.height = c.height,
+            n.depth_scale = c.depth_scale, n.body_T_sensor = c.body_T_sensor
+        """,
+            calibs=list(calibs.values()),
+        )
+
+    n_edges = 0
+    for label, pairs in pairs_by_label.items():
+        db.execute(
+            f"""
+        UNWIND $pairs AS pair
+        MATCH (n:{label} {{nodeSymbol: pair.ns}})
+        MATCH (c:{constants.CAMERA_CALIBS} {{calib_id: pair.calib_id}})
+        MERGE (n)-[:{constants.HAS_CALIB}]->(c)
+        """,
+            pairs=pairs,
+        )
+        n_edges += len(pairs)
+    return n_edges
 
 
 # ---------------------------------------------------------------------------
@@ -763,6 +963,16 @@ def spark_dsg_to_db(G, db, source_file_path=None, image_folder_root=None, mesh_p
     add_buildings_from_dsg(G, db)
     add_subkeyframes_from_dsg(G, db)
     add_edges_from_dsg(G, db)
+
+    # Evidence provenance (additive, best-effort): Observation -> source-frame
+    # edges by capture timestamp, and CameraCalib nodes from the on-disk
+    # camera_calib.json files so visibility reasoning is possible from the DB.
+    try:
+        backfill_agent_timestamps(db)
+        attach_camera_calibs(db)
+        link_observations_to_frames(db)
+    except Exception:
+        logger.exception("evidence-provenance materialization failed (non-fatal)")
 
     # Store labelspaces in Neo4j so db_to_spark_dsg() can reconstruct
     # without requiring external YAML files or function arguments.

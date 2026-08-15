@@ -50,3 +50,26 @@ def test_agent_to_dict_omits_image_folder_when_empty():
     # empty image_folder is still emitted as a key (empty string), matching the
     # existing hasattr-guarded behavior; orientation is always present.
     assert d["rot_w"] == 0.5
+
+
+def test_agent_to_dict_timestamp_from_attribute():
+    import datetime
+
+    attrs = _make_attrs()
+    attrs.timestamp = datetime.timedelta(seconds=1.5)
+    d = agent_to_dict(_FakeAgentNode("a2", attrs))
+    assert d["timestamp_ns"] == 1_500_000_000
+
+
+def test_agent_to_dict_timestamp_falls_back_to_folder_suffix():
+    # Default binding timestamp is timedelta(0) == unset -> parse agent_<ts>.
+    attrs = _make_attrs()  # image_folder ends in agent_42
+    d = agent_to_dict(_FakeAgentNode("a3", attrs))
+    assert d["timestamp_ns"] == 42
+
+
+def test_agent_to_dict_timestamp_absent_when_unparseable():
+    attrs = _make_attrs()
+    attrs.image_folder = "/data/agents/not_numeric"
+    d = agent_to_dict(_FakeAgentNode("a4", attrs))
+    assert "timestamp_ns" not in d
