@@ -25,6 +25,7 @@ ASSERTIONS = "Assertion"
 COVERED = "COVERED"
 SUPPORTS = "SUPPORTS"
 CONTRADICTS = "CONTRADICTS"
+VIEWS = "VIEWS"
 
 # Mappings to/from heracles and spark_dsg
 SPARK_TO_HERACLES_LAYER_NAMES = MappingProxyType(
