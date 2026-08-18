@@ -1447,6 +1447,34 @@ def create_vector_indexes(db, dim: int, model_name: str) -> None:
         db.execute(cypher, dim=dim)
 
 
+def create_epistemic_indexes(db) -> None:
+    """Constraints + lookup indexes for the epistemic layer (SearchEpisode /
+    Assertion nodes written by ``agentic_navigation.evidence.store``).
+
+    Idempotent. These are the schema's first uniqueness constraints:
+    ``episode_id`` / ``assertion_id`` are stable external identities that a
+    JSONL re-import (wipe survival) must MERGE onto, never duplicate. Note
+    ``initialize_db`` wipes nodes but leaves constraints in place, so calling
+    this once per database outlives ingest cycles.
+    """
+    db.execute(
+        f"CREATE CONSTRAINT search_episode_id_unique IF NOT EXISTS "
+        f"FOR (n:{constants.SEARCH_EPISODES}) REQUIRE n.episode_id IS UNIQUE"
+    )
+    db.execute(
+        f"CREATE CONSTRAINT assertion_id_unique IF NOT EXISTS "
+        f"FOR (n:{constants.ASSERTIONS}) REQUIRE n.assertion_id IS UNIQUE"
+    )
+    db.execute(
+        f"CREATE INDEX search_episode_query IF NOT EXISTS "
+        f"FOR (n:{constants.SEARCH_EPISODES}) ON (n.predicate, n.args_json)"
+    )
+    db.execute(
+        f"CREATE INDEX assertion_query IF NOT EXISTS "
+        f"FOR (n:{constants.ASSERTIONS}) ON (n.predicate, n.args_json)"
+    )
+
+
 def set_node_embedding(db, node_symbol: str, vec, model_name: str) -> None:
     """Set the ``embedding``, ``embedding_dim``, ``embedding_model`` properties on a node
     identified by ``nodeSymbol``. ``vec`` is a list[float] or 1D numpy array.
