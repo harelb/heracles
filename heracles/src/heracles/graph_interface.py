@@ -31,6 +31,7 @@ import glob
 import json
 import logging
 import os
+import re
 import neo4j
 import numpy as np
 import parse
@@ -312,11 +313,18 @@ def obj_to_dict(node_classes, obj):
 # ---------------------------------------------------------------------------
 
 
-def insert_nodes_to_db(db, layer_label, node_dicts):
+def insert_nodes_to_db(db, layer_label, node_dicts, default_properties=None):
     """Bulk insert nodes into Neo4j for a given layer.
 
     Uses MERGE on nodeSymbol (idempotent).  Position is stored as a Neo4j
     Point3D.  All other dict keys are set as scalar properties via ``n += node``.
+
+    ``default_properties`` are *defaults*, not values: each is written with
+    ``coalesce(n.<key>, $default)``, so a property already on the node survives
+    the re-ingest. ``n += node`` cannot express that -- it overwrites -- which
+    is exactly how a re-ingest of the same nodeSymbol used to reset a graded
+    ``admission_status`` back to ``trusted_prior`` (see add_objects_from_dsg).
+    Backfills nodes written before the property existed, unlike ON CREATE SET.
 
     If any nodes have boundary_x/y/z (Place2d polygon points), a follow-up
     query converts them to a native Neo4j Point3D list for spatial queries.
@@ -324,15 +332,29 @@ def insert_nodes_to_db(db, layer_label, node_dicts):
     if not node_dicts:
         logger.info("insert_nodes_to_db: no nodes to insert for layer %s", layer_label)
         return
+
+    defaults_clause = ""
+    if default_properties:
+        for key in default_properties:
+            # These become Cypher identifiers; they are module constants, but
+            # refuse anything that could escape the property name position.
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                raise ValueError(f"Unsafe default property name: {key!r}")
+        defaults_clause = "\nSET " + ", ".join(
+            f"n.{key} = coalesce(n.{key}, $defaults.{key})"
+            for key in default_properties
+        )
+
     db.execute(
         f"""
         WITH $nodes AS nodes
         UNWIND nodes AS node
         WITH point({{x: node.pos_x, y: node.pos_y, z: node.pos_z}}) AS p3d, node
         MERGE (n:{layer_label} {{nodeSymbol: node.nodeSymbol}})
-        SET n.center = p3d, n += node
+        SET n.center = p3d, n += node{defaults_clause}
         """,
         nodes=node_dicts,
+        defaults=dict(default_properties or {}),
     )
 
     # Convert flat bbox_x/y/z/l/w/h to Point3D bbox_center and bbox_dim.
@@ -840,13 +862,22 @@ def add_objects_from_dsg(G, image_folder_root, db, object_labelspace=None):
     # explicitly rather than left to a reader's default. Best-effort and
     # additive, like the other provenance hooks: a downstream reader that
     # doesn't know about admission is unaffected by two extra properties.
-    for d in nodes:
-        d.setdefault(constants.ADMISSION_STATUS, constants.TRUSTED_PRIOR)
-        d.setdefault(
-            constants.ADMISSION_POLICY_VERSION, constants.PRIOR_MAP_POLICY_VERSION
-        )
+    #
+    # Passed as DEFAULTS, not as node properties. Stamping the dicts here made
+    # the properties unconditional (setdefault on a dict node_to_dict has just
+    # built always fires), and insert_nodes_to_db's "MERGE ... SET n += node"
+    # then overwrote whatever the node already carried: re-ingesting a map
+    # whose object had been graded "rejected" reset it to "trusted_prior" while
+    # leaving its admission_reason attached. A grading decision outranks an
+    # ingest stamp, so it must only be filled in where it is missing.
+    admission_defaults = {
+        constants.ADMISSION_STATUS: constants.TRUSTED_PRIOR,
+        constants.ADMISSION_POLICY_VERSION: constants.PRIOR_MAP_POLICY_VERSION,
+    }
 
-    insert_nodes_to_db(db, constants.OBJECTS, nodes)
+    insert_nodes_to_db(
+        db, constants.OBJECTS, nodes, default_properties=admission_defaults
+    )
 
     # Process observations from per-object image folders.
     if image_folder_root:
