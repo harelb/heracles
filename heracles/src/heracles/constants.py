@@ -27,6 +27,27 @@ SUPPORTS = "SUPPORTS"
 CONTRADICTS = "CONTRADICTS"
 VIEWS = "VIEWS"
 
+# ---------------------------------------------------------------------------
+# Evidence-admission gate (G1). An :Object row is only a *planning fact* once
+# something explicitly admitted it; `admission_status` records that decision
+# and `admission_policy_version` pins the policy that made it. Kept here so the
+# schema has one owner -- agentic_navigation.evidence.admission mirrors these
+# and a drift-guard test asserts the two stay equal.
+# ---------------------------------------------------------------------------
+ADMISSION_STATUS = "admission_status"
+ADMISSION_POLICY_VERSION = "admission_policy_version"
+ADMISSION_OBSERVATIONS = "admission_observation_ids"
+ADMISSION_REASON = "admission_reason"
+
+# Values of `admission_status`.
+TRUSTED_PRIOR = "trusted_prior"   # ingested from a committed scene graph
+CANDIDATE = "candidate"           # a detector wrote it; nobody graded it
+ADMITTED = "admitted"             # an authority graded it and accepted it
+REJECTED = "rejected"             # an authority graded it and refused it
+
+# The policy under which objects ingested by spark_dsg_to_db are trusted.
+PRIOR_MAP_POLICY_VERSION = "prior_map_legacy_v0"
+
 # Mappings to/from heracles and spark_dsg
 SPARK_TO_HERACLES_LAYER_NAMES = MappingProxyType(
     {

@@ -835,6 +835,17 @@ def add_objects_from_dsg(G, image_folder_root, db, object_labelspace=None):
                     image_folder_root, os.path.basename(d["image_folder"])
                 )
 
+    # Evidence-admission gate (G1): objects arriving here come from a COMMITTED
+    # scene graph -- the prior map -- so they are trusted priors, stamped
+    # explicitly rather than left to a reader's default. Best-effort and
+    # additive, like the other provenance hooks: a downstream reader that
+    # doesn't know about admission is unaffected by two extra properties.
+    for d in nodes:
+        d.setdefault(constants.ADMISSION_STATUS, constants.TRUSTED_PRIOR)
+        d.setdefault(
+            constants.ADMISSION_POLICY_VERSION, constants.PRIOR_MAP_POLICY_VERSION
+        )
+
     insert_nodes_to_db(db, constants.OBJECTS, nodes)
 
     # Process observations from per-object image folders.
