@@ -38,6 +38,9 @@ ADMISSION_STATUS = "admission_status"
 ADMISSION_POLICY_VERSION = "admission_policy_version"
 ADMISSION_OBSERVATIONS = "admission_observation_ids"
 ADMISSION_REASON = "admission_reason"
+# Measured confidence attached by the admitting policy (M2); absent when the
+# admitting authority had no graded signal.
+ADMISSION_BELIEF = "admission_belief"
 
 # Values of `admission_status`.
 TRUSTED_PRIOR = "trusted_prior"   # ingested from a committed scene graph

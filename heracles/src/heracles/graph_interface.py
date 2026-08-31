@@ -649,7 +649,16 @@ def insert_observations_to_db(db, observations):
         o.bbox_2d_max_y = obs.bbox_2d_max_y,
         o.score = coalesce(obs.score, o.score),
         o.detector = coalesce(obs.detector, o.detector),
-        o.mechanism = coalesce(obs.mechanism, o.mechanism)
+        o.mechanism = coalesce(obs.mechanism, o.mechanism),
+        o.target_prompt = coalesce(obs.target_prompt, o.target_prompt),
+        o.target_score = coalesce(obs.target_score, o.target_score),
+        o.control_max_score = coalesce(obs.control_max_score, o.control_max_score),
+        o.margin = coalesce(obs.margin, o.margin),
+        o.control_scores_json = coalesce(obs.control_scores_json, o.control_scores_json),
+        o.depth_valid_px = coalesce(obs.depth_valid_px, o.depth_valid_px),
+        o.view_x = coalesce(obs.view_x, o.view_x),
+        o.view_y = coalesce(obs.view_y, o.view_y),
+        o.view_z = coalesce(obs.view_z, o.view_z)
     """,
         observations=observations,
     )
