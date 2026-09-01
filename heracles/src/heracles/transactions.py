@@ -158,7 +158,7 @@ def admitted_objects(
 ) -> tuple[dict[str, Any], ...]:
     """Return active planning facts, excluding candidates and rejections."""
     records, _, _ = driver.execute_query(
-        "MATCH (n) WHERE (n:Object OR n:SceneEntity) "
+        "MATCH (n) WHERE n.nodeSymbol IS NOT NULL "
         "AND n.retired_at_revision IS NULL "
         "AND n.admission_status IN ['trusted_prior','admitted'] "
         "AND ($class_name IS NULL OR "
@@ -171,4 +171,3 @@ def admitted_objects(
         {"node_symbol": record["node_symbol"], **dict(record["properties"])}
         for record in records
     )
-
