@@ -8,6 +8,7 @@ from typing import Any
 
 ALLOWED_FIELDS = {
     "nodeSymbol",
+    "entity_kind",
     "class",
     "name",
     "layer",
@@ -18,6 +19,29 @@ ALLOWED_FIELDS = {
     "source",
     "admission_status",
 }
+
+ALLOWED_ENTITY_KINDS = {
+    "object",
+    "place",
+    "region",
+    "room",
+    "building",
+    "agent",
+    "keyframe",
+    "traversability",
+    "other",
+}
+
+ENTITY_KIND_EXPRESSION = """coalesce(n.entity_kind, CASE
+    WHEN n.attr_type CONTAINS 'Object' OR n.nodeSymbol STARTS WITH 'O' THEN 'object'
+    WHEN n.attr_type CONTAINS 'Agent' OR n.nodeSymbol STARTS WITH 'a' THEN 'agent'
+    WHEN n.attr_type CONTAINS 'SubKeyframe' OR n.nodeSymbol STARTS WITH 's' THEN 'keyframe'
+    WHEN n.attr_type CONTAINS 'TravNode' OR n.nodeSymbol STARTS WITH 't' THEN 'traversability'
+    WHEN n.attr_type CONTAINS 'Room' OR n.nodeSymbol STARTS WITH 'R' THEN 'room'
+    WHEN n.attr_type CONTAINS 'Building' OR n.nodeSymbol STARTS WITH 'B' THEN 'building'
+    WHEN n.attr_type CONTAINS 'Region' THEN 'region'
+    WHEN n.attr_type CONTAINS 'Place' OR n.nodeSymbol STARTS WITH 'p' THEN 'place'
+    ELSE 'other' END)"""
 
 
 def compile_admitted_query(spec: Mapping[str, Any]) -> tuple[str, dict[str, Any], tuple[str, ...]]:
@@ -41,6 +65,13 @@ def compile_admitted_query(spec: Mapping[str, Any]) -> tuple[str, dict[str, Any]
     classes = tuple(str(value) for value in spec.get("classes") or ())
     symbols = tuple(str(value) for value in spec.get("symbols") or ())
     layers = tuple(int(value) for value in spec.get("layers") or ())
+    entity_kinds = tuple(str(value) for value in spec.get("entity_kinds") or ())
+    invalid_entity_kinds = set(entity_kinds) - ALLOWED_ENTITY_KINDS
+    if invalid_entity_kinds:
+        raise ValueError(f"unsupported entity kinds: {sorted(invalid_entity_kinds)}")
+    if entity_kinds:
+        clauses.append(f"{ENTITY_KIND_EXPRESSION} IN $entity_kinds")
+        parameters["entity_kinds"] = list(entity_kinds)
     if classes:
         clauses.append("toLower(coalesce(n.class,n.name,'')) IN $classes")
         parameters["classes"] = [value.casefold() for value in classes]
@@ -75,23 +106,30 @@ def compile_admitted_query(spec: Mapping[str, Any]) -> tuple[str, dict[str, Any]
             max_distance_m=float(distance),
         )
 
-    query = "MATCH (n) WHERE " + " AND ".join(clauses)
+    query = "MATCH (n:SceneEntity) WHERE " + " AND ".join(clauses)
     if aggregation == "count":
         return query + " RETURN count(DISTINCT n) AS count", parameters, ("count",)
     if aggregation == "distinct_classes":
         return (
             query
-            + " RETURN coalesce(n.class,n.name,'') AS class, count(*) AS count "
+            + " WITH n ORDER BY n.nodeSymbol "
+            + "RETURN coalesce(n.class,n.name,'') AS class, count(*) AS count, "
+            + "collect(DISTINCT n.nodeSymbol)[..10] AS nodeSymbols "
             + "ORDER BY count DESC, class LIMIT $limit",
             parameters,
-            ("class", "count"),
+            ("class", "count", "nodeSymbols"),
         )
 
-    projections = [f"n.`{field}` AS `{field}`" for field in select]
+    projections = [
+        f"{ENTITY_KIND_EXPRESSION} AS `entity_kind`"
+        if field == "entity_kind"
+        else f"n.`{field}` AS `{field}`"
+        for field in select
+    ]
     columns = list(select)
     if spec.get("include_neighbors"):
         query += (
-            " OPTIONAL MATCH (n)-[:SCENE_EDGE]-(neighbor) "
+            " OPTIONAL MATCH (n)-[:SCENE_EDGE]-(neighbor:SceneEntity) "
             "WHERE neighbor.nodeSymbol IS NOT NULL "
             "AND neighbor.retired_at_revision IS NULL "
             "AND neighbor.admission_status IN ['trusted_prior', 'admitted']"
@@ -127,9 +165,15 @@ def execute_admitted_query(
     truncated = len(rows) > limit
     rows = rows[:limit]
     cited = tuple(
-        str(row["nodeSymbol"])
-        for row in rows
-        if row.get("nodeSymbol") is not None
+        dict.fromkeys(
+            str(symbol)
+            for row in rows
+            for symbol in (
+                [row["nodeSymbol"]]
+                if row.get("nodeSymbol") is not None
+                else row.get("nodeSymbols") or ()
+            )
+        )
     )
     return {
         "graph_revision": revision,
