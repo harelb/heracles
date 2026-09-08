@@ -129,8 +129,9 @@ def compile_admitted_query(spec: Mapping[str, Any]) -> tuple[str, dict[str, Any]
     columns = list(select)
     if spec.get("include_neighbors"):
         query += (
-            " OPTIONAL MATCH (n)-[:SCENE_EDGE]-(neighbor:SceneEntity) "
+            " OPTIONAL MATCH (n)-[neighbor_edge:SCENE_EDGE]-(neighbor:SceneEntity) "
             "WHERE neighbor.nodeSymbol IS NOT NULL "
+            "AND neighbor_edge.retired_at_revision IS NULL "
             "AND neighbor.retired_at_revision IS NULL "
             "AND neighbor.admission_status IN ['trusted_prior', 'admitted']"
         )
