@@ -2,20 +2,24 @@
 
 import logging
 import os
-from importlib.resources import as_file, files
+import time
 
-import heracles.constants
-import heracles.resources
 import numpy as np
 import rclpy
 import spark_dsg
-import yaml
 from heracles.dsg_utils import summarize_dsg
 from heracles.graph_interface import db_to_spark_dsg
 from heracles.query_interface import Neo4jWrapper
+from neo4j import GraphDatabase
 from rclpy.node import Node
 
 from heracles_ros.hydra_python_publisher import DsgPublisher
+from heracles_ros.map_state import (
+    METADATA_KEY,
+    get_map_version,
+    map_metadata,
+    seed_db,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,18 +35,6 @@ def center_w_h_to_bb(center, w, h):
     )
 
 
-def load_abs_or_pkg_path_as_yaml(pkg, path):
-    if os.path.exists(path):
-        full_path = path
-    else:
-        with as_file(files(pkg).joinpath(path)) as p:
-            full_path = str(p)
-
-    with open(full_path, "r") as fo:
-        data = yaml.safe_load(fo)
-    return data
-
-
 class HeraclesPublisher(Node):
     def __init__(self):
         super().__init__("heracles_publisher")
@@ -52,8 +44,6 @@ class HeraclesPublisher(Node):
         self.declare_parameter("heracles_port", -1)
         self.declare_parameter("heracles_neo4j_user", "neo4j")
         self.declare_parameter("heracles_neo4j_pass", "neo4j_pw")
-        self.declare_parameter("object_labelspace", "")
-        self.declare_parameter("region_labelspace", "")
 
         ip = self.get_parameter("heracles_ip").get_parameter_value().string_value
         port = self.get_parameter("heracles_port").get_parameter_value().integer_value
@@ -73,82 +63,119 @@ class HeraclesPublisher(Node):
             self.get_parameter("heracles_neo4j_pass").get_parameter_value().string_value
         )
         self.AUTH = (user, pw)
+        self._wait_for_neo4j()
 
-        self.layer_id_to_layer_name = None
-        self.object_label_to_id = None
-        self.room_label_to_id = None
+        # Load a scene graph into the database before publishing anything, so
+        # Neo4j can be the only map: the JSON is just what fills it at startup.
+        # Off by default -- it wipes the database, which must not happen on a
+        # restart mid-run or where something else fills Neo4j.
+        self.declare_parameter("seed_on_start", False)
+        self.declare_parameter("seed_dsg_path", "")
+        seed_path = self.get_parameter("seed_dsg_path").value
+        if self.get_parameter("seed_on_start").value:
+            if seed_path and os.path.isfile(seed_path):
+                version = seed_db(self.URI, self.AUTH, seed_path)
+                self.get_logger().info(
+                    f"Seeded Neo4j from {seed_path} (map_version={version})"
+                )
+            else:
+                # Without a map file, keep whatever Neo4j already holds rather
+                # than dying and publishing no map at all.
+                self.get_logger().error(
+                    f"Not seeding Neo4j: no scene graph at '{seed_path}'. Is the "
+                    "prior map set (run-adt4 -p)? Publishing what Neo4j already holds."
+                )
 
-        # NOTE: Ideally we would store the labelspaces in the database so that we don't need to track this extra metadata
-        object_labelspace_name = (
-            self.get_parameter("object_labelspace").get_parameter_value().string_value
+        self.db = Neo4jWrapper(
+            self.URI, self.AUTH, atomic_queries=True, print_profiles=False
         )
-        assert object_labelspace_name != "", "Please set `object_labelspace`"
-        region_labelspace_name = (
-            self.get_parameter("region_labelspace").get_parameter_value().string_value
-        )
-        assert region_labelspace_name != "", "Please set `reigon_labelspace`"
-        self.setup_labelspaces(object_labelspace_name, region_labelspace_name)
+        self.db.connect()
 
         self.dsg_sender = DsgPublisher(self, "~/dsg_out", True)
-        # Timer to publish DSG at regular intervals
-        timer_period_s = 5
-        self.timer = self.create_timer(timer_period_s, self.publish_dsg)
-
-    def setup_labelspaces(self, object_labelspace_name, region_labelspace_name):
-        object_labelspace = load_abs_or_pkg_path_as_yaml(
-            heracles.resources, object_labelspace_name
+        # Republish as soon as a writer bumps map_version, so nobody plans on
+        # the graph from before a change for up to a full period. The slow
+        # period still republishes changes that do not bump the version, such
+        # as a held object following its robot.
+        self.declare_parameter("version_poll_period_s", 0.5)
+        self.declare_parameter("publish_period_s", 5.0)
+        self._publish_period_s = self.get_parameter("publish_period_s").value
+        self._published_version = None
+        self._last_publish = None
+        self.timer = self.create_timer(
+            self.get_parameter("version_poll_period_s").value, self.poll_db
         )
 
-        id_to_object_label = {
-            item["label"]: item["name"] for item in object_labelspace["label_names"]
-        }
+    def _wait_for_neo4j(self):
+        """Neo4j often starts together with this node: wait rather than die."""
+        while True:
+            try:
+                with GraphDatabase.driver(self.URI, auth=self.AUTH) as driver:
+                    driver.verify_connectivity()
+                return
+            except Exception as ex:
+                self.get_logger().warn(
+                    f"Waiting for Neo4j at {self.URI}: {ex}",
+                    throttle_duration_sec=10.0,
+                )
+                time.sleep(2.0)
 
-        self.get_logger().info(f"region_labelspace_name: {region_labelspace_name}")
-        room_labelspace = load_abs_or_pkg_path_as_yaml(
-            heracles.resources, region_labelspace_name
+    def poll_db(self):
+        # A Neo4j hiccup must not kill the node: restarting it would reseed and
+        # wipe the map. Skip this tick; the driver reconnects on its own.
+        try:
+            self._poll_db()
+        except Exception as ex:
+            self.get_logger().error(
+                f"Neo4j unavailable, map not published: {ex}",
+                throttle_duration_sec=5.0,
+            )
+
+    def _poll_db(self):
+        version = get_map_version(self.db)
+        now = self.get_clock().now()
+        stale = (
+            self._last_publish is None
+            or (now - self._last_publish).nanoseconds * 1e-9 >= self._publish_period_s
         )
-
-        id_to_room_label = {
-            item["label"]: item["name"] for item in room_labelspace["label_names"]
-        }
-        self.get_logger().info(f"id_to_room_label: {id_to_room_label}")
-
-        # Define a layer id map
-        self.layer_id_to_layer_name = {
-            20: heracles.constants.MESH_PLACES,
-            3: heracles.constants.PLACES,
-            2: heracles.constants.OBJECTS,
-            4: heracles.constants.ROOMS,
-            5: heracles.constants.BUILDINGS,
-        }
-
-        self.object_label_to_id = {v: k for k, v in id_to_object_label.items()}
-        self.room_label_to_id = {v: k for k, v in id_to_room_label.items()}
+        if version != self._published_version or stale:
+            self.publish_dsg()
 
     def publish_dsg(self):
-        with Neo4jWrapper(
-            self.URI, self.AUTH, atomic_queries=True, print_profiles=False
-        ) as db:
-            new_scene_graph = db_to_spark_dsg(
-                db,
-                self.layer_id_to_layer_name,
-                self.object_label_to_id,
-                self.room_label_to_id,
-            )
+        # Read the metadata before the graph: a write landing in between makes
+        # the graph newer than its version says, never older, and the next poll
+        # republishes it under the new version.
+        metadata = map_metadata(self.db)
+        new_scene_graph = db_to_spark_dsg(self.db)
+        new_scene_graph.metadata.add(metadata)
         summarize_dsg(new_scene_graph)
 
         for n in new_scene_graph.get_layer(spark_dsg.DsgLayers.MESH_PLACES).nodes:
-            n.attributes.bounding_box = spark_dsg.BoundingBox(
-                (1, 1, 0.001), n.attributes.position
-            )
-            corners = center_w_h_to_bb(n.attributes.position, 1, 1)
-            boundary = np.zeros((4, 3))
-            boundary[:, :2] = corners
-            boundary[:, 2] = n.attributes.position[2]
-            n.attributes.boundary = boundary
+            # Assign bounding_box if the attribute type supports it
+            if hasattr(n.attributes, "bounding_box"):
+                n.attributes.bounding_box = spark_dsg.BoundingBox(
+                    (1, 1, 0.001), n.attributes.position
+                )
+
+            # Assign boundary polygon if the attribute type supports it.
+            if hasattr(n.attributes, "boundary"):
+                corners = center_w_h_to_bb(n.attributes.position, 1, 1)
+                boundary = np.zeros((4, 3))
+                boundary[:, :2] = corners
+                boundary[:, 2] = n.attributes.position[2]
+                n.attributes.boundary = boundary
 
         self.dsg_sender.publish(new_scene_graph, frame_id="map")
-        self.get_logger().info("Published map")
+        state = metadata[METADATA_KEY]
+        self._published_version = state["map_version"]
+        self._last_publish = self.get_clock().now()
+        self.get_logger().info(
+            f"Published map (map_version={state['map_version']}, "
+            f"holding={state['holding']})"
+        )
+
+    def destroy_node(self):
+        self.db.close()
+        super().destroy_node()
 
 
 def main(args=None):
