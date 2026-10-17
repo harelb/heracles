@@ -44,7 +44,7 @@ def extract_labelspaces_from_dsg(G):
     return object_ls, room_ls
 
 
-def load_dsg_to_db(neo4j_uri, neo4j_creds, scene_graph, image_folder_root=None):
+def load_dsg_to_db(neo4j_uri, neo4j_creds, scene_graph, image_store=None):
     """Load a DSG into Neo4j.
 
     Labelspaces must be embedded in the DSG metadata via ``set_labelspace()``.
@@ -55,9 +55,11 @@ def load_dsg_to_db(neo4j_uri, neo4j_creds, scene_graph, image_folder_root=None):
     neo4j_uri : str
     neo4j_creds : tuple[str, str]
     scene_graph : spark_dsg.DynamicSceneGraph
-    image_folder_root : str or None
-        Root directory containing per-object image folders.  When provided,
-        Observation nodes are created from ``*_meta.json`` files found there.
+    image_store : str, list of str, hydra_image_store.ImageStore or None
+        Image store directory (or one per robot) written by Hydra. When provided,
+        Observation, SubKeyframe and CameraCalib nodes are created from it and
+        Agent nodes get their keyframe image paths. A legacy run directory
+        raises a clear error pointing at ``hydra-image-store import-legacy``.
     """
     # Set the layer id to layer name mappings
     spark_layer_id_to_heracles_layer_str = {
@@ -80,4 +82,4 @@ def load_dsg_to_db(neo4j_uri, neo4j_creds, scene_graph, image_folder_root=None):
         initialize_db(db)
         # Load the scene graph into the DB
         print("Loading the scene graph into the database.")
-        spark_dsg_to_db(scene_graph, db, image_folder_root=image_folder_root)
+        spark_dsg_to_db(scene_graph, db, image_store=image_store)

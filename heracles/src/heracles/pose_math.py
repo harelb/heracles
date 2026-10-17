@@ -26,3 +26,23 @@ def compose_pose(world_t_anchor, world_R_anchor, anchor_t_sub, anchor_R_sub):
     world_t_sub = np.asarray(world_t_anchor) + quat_rotate(world_R_anchor, np.asarray(anchor_t_sub))
     world_R_sub = quat_mul(world_R_anchor, anchor_R_sub)
     return world_t_sub, world_R_sub
+
+
+def rot_to_quat(R):
+    """3x3 rotation matrix -> unit quaternion (w, x, y, z), w >= 0."""
+    R = np.asarray(R, dtype=float)
+    t = R[0, 0] + R[1, 1] + R[2, 2]
+    if t > 0.0:
+        s = 2.0 * np.sqrt(t + 1.0)
+        q = np.array([0.25 * s, (R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s])
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        q = np.array([(R[2, 1] - R[1, 2]) / s, 0.25 * s, (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s])
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        q = np.array([(R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s, 0.25 * s, (R[1, 2] + R[2, 1]) / s])
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        q = np.array([(R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s, (R[1, 2] + R[2, 1]) / s, 0.25 * s])
+    q = q / np.linalg.norm(q)
+    return -q if q[0] < 0 else q

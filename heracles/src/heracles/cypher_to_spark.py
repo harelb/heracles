@@ -16,9 +16,6 @@ def spark_object_from_db(db_object, label_to_id):
         [db_object["bbox_x"], db_object["bbox_y"], db_object["bbox_z"]],  # center
     )
 
-    if "image_folder" in db_object:
-        attrs.image_folder = db_object["image_folder"]
-
     try:
         if "details" in db_object:
             attrs.details = db_object["details"]

@@ -18,5 +18,8 @@ setup(
         "openai",
         "parse",
         "spark-dsg",
+        # Image-store reader (not on PyPI): pip install -e <Hydra>/hydra_image_store
+        # or "hydra_image_store @ git+https://github.com/harelb/Hydra.git@feature/image-store#subdirectory=hydra_image_store"
+        "hydra_image_store",
     ],
 )
