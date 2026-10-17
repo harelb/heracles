@@ -12,7 +12,6 @@ class TestCypherToSpark(unittest.TestCase):
             "class": "chair",
             "bbox_x": 1.0, "bbox_y": 2.0, "bbox_z": 3.0,
             "bbox_l": 0.5, "bbox_w": 0.5, "bbox_h": 1.0,
-            "image_folder": "/path/to/images",
             "details": "some details",
             "observations": [{"id": 1}, {"id": 2}]
         }
@@ -28,10 +27,6 @@ class TestCypherToSpark(unittest.TestCase):
         np.testing.assert_array_equal(attrs.bounding_box.min, np.array([0.75, 1.75, 2.5])) # 1.0 - 0.5/2
         
         # Verify custom/optional attributes
-        # image_folder should be supported now
-        if "image_folder" in db_object:
-             self.assertEqual(attrs.image_folder, "/path/to/images")
-
         # details might still be problematic in some envs, so we keep the check or just assert if we trust the user
         if hasattr(attrs, "details") and attrs.details == "some details":
              self.assertEqual(attrs.details, "some details")

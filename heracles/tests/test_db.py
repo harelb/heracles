@@ -21,6 +21,9 @@ from heracles.graph_interface import (
     obj_to_dict,
 )
 from heracles.query_interface import Neo4jWrapper
+from image_store_fixture import build_store
+from hydra_image_store import ImageStore
+from heracles.graph_interface import add_agents_from_dsg, add_subkeyframes_from_dsg
 
 
 def try_drop_index(db, index_name):
@@ -111,10 +114,9 @@ def build_test_dsg():
     agent_attrs = spark_dsg.AgentNodeAttributes()
     agent_attrs.position = [4.0, 5.0, 6.0]
     agent_attrs.world_R_body = spark_dsg.Quaternion(0.5, 0.5, 0.5, 0.5)
-    agent_attrs.image_folder = "agent_777"
     # Agents must live in a NON-ZERO partition keyed by the 'a' prefix
     # (ord('a')==97). The string-layer add_node overload always inserts at
-    # partition 0, which _collect_keyframe_agents deliberately skips — so use
+    # partition 0, which _collect_agents deliberately skips — so use
     # the (layer_id:int, node_id, attrs, partition:int) overload explicitly.
     G.add_node(2, spark_dsg.NodeSymbol("a", 0), agent_attrs, ord("a"))
 
@@ -125,24 +127,7 @@ def build_test_dsg():
     anchor_attrs = spark_dsg.AgentNodeAttributes()
     anchor_attrs.position = [4.0, 5.0, 6.0]
     anchor_attrs.world_R_body = spark_dsg.Quaternion(1.0, 0.0, 0.0, 0.0)
-    anchor_attrs.image_folder = "agent_888"
     G.add_node(2, spark_dsg.NodeSymbol("a", 1), anchor_attrs, ord("a"))
-
-    sub_attrs = spark_dsg.SubKeyframeNodeAttributes()
-    sub_attrs.position = [0.0, 0.0, 0.0]  # seed; heracles recomputes from anchor
-    sub_attrs.anchor_node_id = spark_dsg.NodeSymbol("a", 1).value
-    sub_attrs.anchor_t_subframe = [0.5, 0.0, 0.0]
-    sub_attrs.anchor_R_subframe = spark_dsg.Quaternion(1.0, 0.0, 0.0, 0.0)
-    sub_attrs.image_folder = "subkf_777"
-    # NOTE: attrs.timestamp is bound as a chrono duration -> python exposes it
-    # as datetime.timedelta (NOT an int); assigning a bare int fails.
-    sub_attrs.timestamp = datetime.timedelta(microseconds=999)
-    G.add_node(
-        2,
-        spark_dsg.NodeSymbol("s", 0),
-        sub_attrs,
-        ord("s"),
-    )
 
     return G
 
@@ -152,10 +137,14 @@ def populated_db():
     G = build_test_dsg()
     add_dsg_metadata(G)
 
-    # IP / Port for database
-    URI = "neo4j://127.0.0.1:7687"
+    # IP / Port for database (override to point at a throwaway instance; the
+    # fixture WIPES the database).
+    URI = os.environ.get("HERACLES_TEST_NEO4J_URI", "neo4j://127.0.0.1:7687")
     # Database name / password for database
-    AUTH = ("neo4j", "neo4j_pw")
+    AUTH = (
+        os.environ.get("HERACLES_TEST_NEO4J_USER", "neo4j"),
+        os.environ.get("HERACLES_TEST_NEO4J_PASSWORD", "neo4j_pw"),
+    )
     db = Neo4jWrapper(URI, AUTH, atomic_queries=True, print_profiles=False)
     db.connect()
 
@@ -192,72 +181,44 @@ def populated_db():
     """
     )
     
-    # Create temp dir for images
+    # Image store: o0 has an observation; a0/a1 have keyframes; two
+    # sub-keyframes (one anchored to a1 with offset [0.5, 0, 0], one unanchored).
     with tempfile.TemporaryDirectory() as temp_dir:
-        # Create dummy image folder for object "o0"
-        obj_folder = os.path.join(temp_dir, "O_0")
-        os.makedirs(obj_folder, exist_ok=True)
-        
-        # Create dummy meta file
-        meta_data = {
-            "timestamp_ns": 123456789,
-            "mask_file": "frame_1_mask.png",
-            "bbox_2d": {
-                "min_x": 10, "min_y": 20, "max_x": 100, "max_y": 200
-            }
-        }
-        with open(os.path.join(obj_folder, "frame_1_meta.json"), 'w') as f:
-            json.dump(meta_data, f)
-            
-        # Custom obj_to_dict wrapper to inject image_folder
-        original_obj_to_dict = obj_to_dict
-        def mock_obj_to_dict(node_classes, obj):
-            d = original_obj_to_dict(node_classes, obj)
-            # Inject image_folder for o0 to point to our temp folder name (basename)
-            if d["nodeSymbol"] == "o0":
-                d["image_folder"] = "O_0"
-            return d
+        o0 = spark_dsg.NodeSymbol("o", 0).value
+        o1 = spark_dsg.NodeSymbol("o", 9).value  # merged child, not in the DSG
+        store_dir = build_store(temp_dir, obj1=o0, obj2=o1)
+        store = ImageStore.open(store_dir)
+        object_ls = {"0": "unknown", "4": "ground", "15": "rock", "34": "box"}
 
-        with patch("heracles.graph_interface.obj_to_dict", side_effect=mock_obj_to_dict):
-            # We pass temp_dir as image_folder_root
-            add_objects_from_dsg(G, temp_dir, db)
-            
+        add_objects_from_dsg(G, db, store, object_labelspace=object_ls)
         add_places_from_dsg(G, db)
-        add_mesh_places_from_dsg(G, db)
+        add_mesh_places_from_dsg(G, db, object_labelspace=object_ls)
         add_rooms_from_dsg(G, db)
         add_buildings_from_dsg(G, db)
         add_edges_from_dsg(G, db)
-
-        from heracles.graph_interface import add_agents_from_dsg
-        add_agents_from_dsg(G, temp_dir, db)
-
-        from heracles.graph_interface import add_subkeyframes_from_dsg
-        add_subkeyframes_from_dsg(G, db)
+        add_agents_from_dsg(G, db, store)
+        add_subkeyframes_from_dsg(G, db, store)
 
         yield db
-    
+
     # db.close() # Clean up at end if needed, but yield handles it usually. 
     # The original code closed it after yield.
     db.close()
 
 
 def test_observations(populated_db):
-    # Verify Observation created
-    q = populated_db.query(
-        """MATCH (obs:Observation) RETURN obs"""
-    )
-    assert len(q) == 1
+    # Two store observations (own track + merged child's track), both on o0.
+    q = populated_db.query("""MATCH (obs:Observation) RETURN obs ORDER BY obs.score DESC""")
+    assert len(q) == 2
     obs = q[0]["obs"]
-    assert obs["timestamp_ns"] == 123456789
-    assert obs["mask_file"] == "frame_1_mask.png"
-    assert obs["bbox_2d_min_x"] == 10
-    
-    # Verify connection to object
+    assert obs["timestamp_ns"] == 100
+    assert obs["bbox_2d_min_x"] == 1 and obs["bbox_2d"] == [1, 2, 5, 6]
+
     q = populated_db.query(
         """MATCH (o:Object {nodeSymbol: "o0"})-[:HAS_OBSERVATION]->(obs:Observation) RETURN obs"""
     )
-    assert len(q) == 1
-    assert q[0]["obs"]["nodeSymbol"] == "o0_123456789"
+    assert len(q) == 2
+    assert {r["obs"]["nodeSymbol"] for r in q} == {"o0_100", "o0_101"}
 
 
 def test_rooms(populated_db):
@@ -309,7 +270,7 @@ def test_agents(populated_db):
     q = populated_db.query(
         """MATCH (a:Agent {nodeSymbol: "a0"})
            RETURN a.center AS center, a.rot_w AS rw, a.rot_x AS rx,
-                  a.rot_y AS ry, a.rot_z AS rz, a.image_folder AS img"""
+                  a.rot_y AS ry, a.rot_z AS rz, a.rgb_path AS rgb"""
     )
     assert len(q) == 1
     row = q[0]
@@ -318,25 +279,37 @@ def test_agents(populated_db):
     assert np.isclose(row["rx"], 0.5)
     assert np.isclose(row["ry"], 0.5)
     assert np.isclose(row["rz"], 0.5)
-    assert row["img"] == "agent_777"
+    assert row["rgb"].endswith("kf0.jpg") or "_rgb" in row["rgb"]
 
 
 def test_subkeyframes(populated_db):
-    # anchor is a1 ([4,5,6], identity rotation) + relative offset [0.5,0,0]
+    # anchor is a1 ([4,5,6], identity rotation) + stored offset [0.5,0,0]
     # -> composed world center = [4.5, 5, 6].
     q = populated_db.query(
-        """MATCH (s:SubKeyframe {nodeSymbol: "s0"})
-           RETURN s.center AS center, s.timestamp_ns AS ts, s.image_folder AS img"""
+        """MATCH (s:SubKeyframe)-[:ANCHORED_TO]->(a:Agent {nodeSymbol:"a1"})
+           RETURN s.center AS center, s.timestamp_ns AS ts, s.rgb_path AS rgb,
+                  s.frame_id AS fid, a.nodeSymbol AS ns"""
     )
     assert len(q) == 1
     assert np.all(np.isclose(q[0]["center"], np.array([4.5, 5.0, 6.0])))
-    # sub_attrs.timestamp = timedelta(microseconds=999) -> 999 * 1000 ns.
-    assert q[0]["ts"] == 999000
-    assert q[0]["img"] == "subkf_777"
+    assert q[0]["ts"] == 150
+    assert q[0]["rgb"].endswith("150_rgb.jpg")
 
-    # ANCHORED_TO edge to the anchor agent (a1, NOT a0 -- see build_test_dsg).
-    q2 = populated_db.query(
-        """MATCH (s:SubKeyframe {nodeSymbol:"s0"})-[:ANCHORED_TO]->(a:Agent {nodeSymbol:"a1"})
-           RETURN a.nodeSymbol AS ns"""
+    # One SubKeyframe per store sub-keyframe, anchored or not.
+    n = populated_db.query("MATCH (s:SubKeyframe) RETURN count(s) AS n")
+    assert n[0]["n"] == 2
+
+
+def test_object_observations(populated_db):
+    q = populated_db.query(
+        """MATCH (:Object {nodeSymbol:"o0"})-[:HAS_OBSERVATION]->(o:Observation)
+           RETURN o ORDER BY o.score DESC"""
     )
-    assert len(q2) == 1 and q2[0]["ns"] == "a1"
+    # o0's own track plus the merged child o1's track.
+    assert len(q) == 2
+    best = q[0]["o"]
+    assert best["kept"] is True and best["bbox_2d"] == [1, 2, 5, 6]
+    assert best["mask_file"].endswith(".png") and best["mask_file"] == os.path.basename(best["mask_path"])
+    assert best["rgb_path"].endswith("100_rgb.jpg")
+    assert best["nodeSymbol"] == "o0_100"
+    assert q[1]["o"]["kept"] is False and q[1]["o"].get("mask_path") is None

@@ -24,7 +24,6 @@ def _make_attrs():
     attrs.position = [1.0, 2.0, 3.0]
     # w, x, y, z — a non-identity rotation so we detect field mixups
     attrs.world_R_body = spark_dsg.Quaternion(0.5, 0.5, 0.5, 0.5)
-    attrs.image_folder = "/data/agents/agent_42"
     return attrs
 
 
@@ -37,19 +36,7 @@ def test_agent_to_dict_includes_position_and_orientation():
     assert d["pos_x"] == 1.0 and d["pos_y"] == 2.0 and d["pos_z"] == 3.0
     assert d["rot_w"] == 0.5 and d["rot_x"] == 0.5
     assert d["rot_y"] == 0.5 and d["rot_z"] == 0.5
-    assert d["image_folder"] == "/data/agents/agent_42"
-
-
-def test_agent_to_dict_omits_image_folder_when_empty():
-    attrs = _make_attrs()
-    attrs.image_folder = ""
-    node = _FakeAgentNode("a1", attrs)
-
-    d = agent_to_dict(node)
-
-    # empty image_folder is still emitted as a key (empty string), matching the
-    # existing hasattr-guarded behavior; orientation is always present.
-    assert d["rot_w"] == 0.5
+    assert "image_folder" not in d
 
 
 def test_agent_to_dict_timestamp_from_attribute():
@@ -61,15 +48,8 @@ def test_agent_to_dict_timestamp_from_attribute():
     assert d["timestamp_ns"] == 1_500_000_000
 
 
-def test_agent_to_dict_timestamp_falls_back_to_folder_suffix():
-    # Default binding timestamp is timedelta(0) == unset -> parse agent_<ts>.
-    attrs = _make_attrs()  # image_folder ends in agent_42
-    d = agent_to_dict(_FakeAgentNode("a3", attrs))
-    assert d["timestamp_ns"] == 42
-
-
-def test_agent_to_dict_timestamp_absent_when_unparseable():
-    attrs = _make_attrs()
-    attrs.image_folder = "/data/agents/not_numeric"
-    d = agent_to_dict(_FakeAgentNode("a4", attrs))
+def test_agent_to_dict_timestamp_absent_when_unset():
+    # Default binding timestamp is timedelta(0) == unset; the store's keyframe
+    # frame supplies it in _collect_agents.
+    d = agent_to_dict(_FakeAgentNode("a3", _make_attrs()))
     assert "timestamp_ns" not in d

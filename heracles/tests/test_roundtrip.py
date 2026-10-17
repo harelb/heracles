@@ -288,12 +288,10 @@ def _build_object_and_agent_graph():
 
     obj = spark_dsg.KhronosObjectAttributes()
     obj.position = np.array([1.0, 2.0, 3.0])
-    obj.image_folder = "/crops/O5"
     G.add_node(2, spark_dsg.NodeSymbol("O", 5).value, obj, 0)
 
     agent = spark_dsg.AgentNodeAttributes()
     agent.position = np.array([10.0, 20.0, 30.0])
-    agent.image_folder = "/abs/agents/agent_123"
     G.add_node(2, spark_dsg.NodeSymbol("a", 0).value, agent, ord("a"))
     return G
 
@@ -308,77 +306,19 @@ class TestAgentPartition:
 
         G = _build_object_and_agent_graph()
         cap = _CaptureDB()
-        # image_folder_root is the OBJECT-crop dir; agents must NOT be rebased onto it.
-        add_agents_from_dsg(G, "/crops", cap)
+        add_agents_from_dsg(G, cap)
 
         assert cap.captured_agents is not None, "no agents were written"
         syms = [a["nodeSymbol"] for a in cap.captured_agents]
         # Exactly the real agent; the object O5 must NOT be written as an Agent.
         assert syms == ["a0"], f"expected only the agent a0, got {syms}"
 
-    def test_agent_image_folder_not_rebased(self):
-        from heracles.graph_interface import add_agents_from_dsg
-
-        G = _build_object_and_agent_graph()
-        cap = _CaptureDB()
-        add_agents_from_dsg(G, "/crops", cap)
-
-        agent = cap.captured_agents[0]
-        # The agent's image_folder is already an absolute agents/ prefix; it must
-        # be preserved verbatim, not joined onto the object-crop root.
-        assert agent["image_folder"] == "/abs/agents/agent_123"
-
     def test_object_not_mislabeled_as_agent(self):
         from heracles.graph_interface import add_agents_from_dsg
 
         G = _build_object_and_agent_graph()
         cap = _CaptureDB()
-        add_agents_from_dsg(G, "/crops", cap)
+        add_agents_from_dsg(G, cap)
 
         syms = [a["nodeSymbol"] for a in (cap.captured_agents or [])]
         assert "O5" not in syms, "object O5 was mislabeled as an Agent"
-
-
-def _build_frontend_like_graph(folders):
-    """A DSG with agent nodes a0..a{N-1}, each with the given image_folder (or '')."""
-    G = spark_dsg.DynamicSceneGraph()
-    G.add_layer(2, ord("a"), spark_dsg.DsgLayers.AGENTS)
-    for i, folder in enumerate(folders):
-        a = spark_dsg.AgentNodeAttributes()
-        a.position = np.array([float(i), 0.0, 0.0])
-        a.image_folder = folder
-        G.add_node(2, spark_dsg.NodeSymbol("a", i).value, a, ord("a"))
-    return G
-
-
-class TestMergeAgentImageFolders:
-    """merge_agent_image_folders upserts image_folder by symbol (no rebasing),
-    so backend agent nodes that lost image_folder during pose-graph optimization
-    can be filled from the sibling frontend DSG."""
-
-    def test_merges_all_nonempty_folders(self):
-        from heracles.graph_interface import merge_agent_image_folders
-
-        # frontend-like: a0,a1,a2 all have folders (backend would have dropped a1).
-        G = _build_frontend_like_graph(["/agents/agent_0", "/agents/agent_1", "/agents/agent_2"])
-        cap = _CaptureDB()
-        n = merge_agent_image_folders(G, cap)
-
-        assert n == 3
-        rows = {a["nodeSymbol"]: a["image_folder"] for a in cap.captured_agents}
-        assert rows == {
-            "a0": "/agents/agent_0",
-            "a1": "/agents/agent_1",
-            "a2": "/agents/agent_2",
-        }
-
-    def test_skips_empty_folders(self):
-        from heracles.graph_interface import merge_agent_image_folders
-
-        G = _build_frontend_like_graph(["/agents/agent_0", "", "/agents/agent_2"])
-        cap = _CaptureDB()
-        n = merge_agent_image_folders(G, cap)
-
-        assert n == 2
-        syms = {a["nodeSymbol"] for a in cap.captured_agents}
-        assert syms == {"a0", "a2"}

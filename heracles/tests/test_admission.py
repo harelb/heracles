@@ -61,7 +61,7 @@ def captured(monkeypatch):
 
 
 def test_ingested_objects_are_stamped_trusted_prior(captured):
-    add_objects_from_dsg(_dsg_with_one_object(), None, db=None,
+    add_objects_from_dsg(_dsg_with_one_object(), db=None,
                          object_labelspace={"2": "box"})
 
     assert len(captured) == 1
@@ -81,7 +81,7 @@ def test_the_stamp_is_not_written_into_the_node_payload(captured):
     "SET n += node" -- which overwrites. Keeping it out of the payload is what
     makes the coalesce in insert_nodes_to_db reachable.
     """
-    add_objects_from_dsg(_dsg_with_one_object(), None, db=None,
+    add_objects_from_dsg(_dsg_with_one_object(), db=None,
                          object_labelspace={"2": "box"})
 
     _, nodes, defaults = captured[0]
@@ -168,7 +168,7 @@ def test_reingest_does_not_overwrite_a_graded_admission(clean_db):
 
     # O0 is the graded node; O1 is new to the database.
     add_objects_from_dsg(
-        _dsg_with_objects(0, 1), None, db=db, object_labelspace={"2": "box"}
+        _dsg_with_objects(0, 1), db=db, object_labelspace={"2": "box"}
     )
 
     graded = _admission(db, "O0")
@@ -187,7 +187,7 @@ def test_reingest_does_not_overwrite_a_graded_admission(clean_db):
 def test_fresh_ingest_stamps_trusted_prior_in_the_db(clean_db):
     db = clean_db
     add_objects_from_dsg(
-        _dsg_with_one_object(), None, db=db, object_labelspace={"2": "box"}
+        _dsg_with_one_object(), db=db, object_labelspace={"2": "box"}
     )
     stamped = _admission(db, "O0")
     assert stamped["status"] == constants.TRUSTED_PRIOR
@@ -198,7 +198,7 @@ def test_reingest_is_idempotent_for_a_trusted_prior(clean_db):
     db = clean_db
     for _ in range(2):
         add_objects_from_dsg(
-            _dsg_with_one_object(), None, db=db, object_labelspace={"2": "box"}
+            _dsg_with_one_object(), db=db, object_labelspace={"2": "box"}
         )
     stamped = _admission(db, "O0")
     assert stamped["status"] == constants.TRUSTED_PRIOR
