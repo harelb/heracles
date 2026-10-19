@@ -53,3 +53,12 @@ def test_agent_to_dict_timestamp_absent_when_unset():
     # frame supplies it in _collect_agents.
     d = agent_to_dict(_FakeAgentNode("a3", _make_attrs()))
     assert "timestamp_ns" not in d
+
+
+def test_agent_to_dict_timestamp_keeps_microsecond_precision():
+    import datetime
+
+    attrs = _make_attrs()
+    attrs.timestamp = datetime.timedelta(seconds=1761240887, microseconds=606512)
+    d = agent_to_dict(_FakeAgentNode("a3", attrs))
+    assert d["timestamp_ns"] == 1761240887606512000

@@ -27,6 +27,7 @@ Edge handling remains layer-aware since edge types are determined by the
 layer relationship (intralayer vs interlayer), not by attribute types.
 """
 
+import datetime
 import json
 import logging
 import os
@@ -486,7 +487,7 @@ def agent_to_dict(agent):
     # caster) and DEFAULTS to timedelta(0) when unset; treat 0 as unset (the
     # image store's keyframe frame supplies the timestamp then).
     ts = getattr(attrs, "timestamp", None)
-    ts_ns = round(ts.total_seconds() * 1e9) if ts is not None else 0
+    ts_ns = (ts // datetime.timedelta(microseconds=1)) * 1000 if ts is not None else 0
     if ts_ns > 0:
         d["timestamp_ns"] = ts_ns
 
@@ -577,7 +578,9 @@ def _collect_agents(G, store=None):
                 d["frame_id"] = int(f.frame_id)
                 d["rgb_path"] = _path_or_none(f.rgb_path)
                 d["depth_path"] = _path_or_none(f.depth_path)
-                d.setdefault("timestamp_ns", int(f.timestamp_ns))
+                # The store timestamp is exact; the DSG attribute only has float
+                # (microsecond) precision through the python timedelta binding.
+                d["timestamp_ns"] = int(f.timestamp_ns)
             agents.append(d)
     return agents
 
