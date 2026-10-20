@@ -70,6 +70,10 @@ def _holding_call(db, is_holding, object_id, position=None, robot_pose=None):
         _get_robot_pose=lambda name: robot_pose,
         get_logger=lambda: NS(info=lambda *_: None, error=lambda *_: None),
     )
+    # the callback delegates to _update_holding_state (it catches Neo4j errors)
+    updater._update_holding_state = lambda *args: HeraclesStateUpdater._update_holding_state(
+        updater, *args
+    )
     req = UpdateHoldingState.Request()
     req.is_holding, req.id = is_holding, object_id
     if position is not None:

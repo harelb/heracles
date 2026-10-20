@@ -11,7 +11,7 @@ from heracles_agents.dsg_interfaces import HeraclesDsgInterface
 from heracles_ros_interfaces.srv import UpdateHoldingState
 from rclpy.node import Node
 
-from heracles_ros.map_state import bump_map_version
+from heracles_ros.map_state import notify_map_change
 
 
 class HeraclesStateUpdater(Node):
@@ -146,7 +146,8 @@ class HeraclesStateUpdater(Node):
                     last_pos_success = set_obj_center(db, object_id, *put_at)
                     response.success = last_pos_success and unhold_success
             if response.success:
-                bump_map_version(db)
+                # both counters: the publisher's _MapState and the console's _State
+                notify_map_change(db, ["objects"], [object_id])
 
     def timer_callback(self):
         for name in self.robot_names:

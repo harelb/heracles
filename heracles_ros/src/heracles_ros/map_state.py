@@ -17,28 +17,24 @@ updates do not bump the version: they are not changes to the map.
 
 from __future__ import annotations
 
-from typing import Dict, List
+import os
+from typing import Dict, List, Optional
 
 import spark_dsg
+from heracles import graph_interface
 from heracles.query_interface import Neo4jWrapper
 from heracles.utils import load_dsg_to_db
 
 METADATA_KEY = "heracles"
-_MAP_STATE = "_MapState"
+_MAP_STATE = graph_interface._MAP_STATE
 
 
-def get_map_version(db) -> int:
-    rows = db.query(f"MATCH (m:{_MAP_STATE}) RETURN m.version AS v")
-    return int(rows[0]["v"]) if rows and rows[0]["v"] is not None else 0
-
-
-def bump_map_version(db) -> int:
-    rows = db.query(
-        f"MERGE (m:{_MAP_STATE}) "
-        "SET m.version = coalesce(m.version, 0) + 1 "
-        "RETURN m.version AS v"
-    )
-    return int(rows[0]["v"])
+# The counters live in heracles (no ROS dependency) so non-ROS writers (console,
+# SAM3 query server) bump exactly the same nodes; prefer notify_map_change, which
+# bumps both _MapState.version and the console's _State.version.
+get_map_version = graph_interface.get_map_version
+bump_map_version = graph_interface.bump_map_version
+notify_map_change = graph_interface.notify_map_change
 
 
 def get_holding(db) -> Dict[str, List[str]]:
@@ -61,13 +57,40 @@ def map_metadata(db) -> dict:
     }
 
 
-def seed_db(uri: str, auth: tuple, dsg_path: str) -> int:
+def find_run_image_store(dsg_path: str) -> Optional[str]:
+    """The image store of the run a scene graph belongs to, or ``None``.
+
+    Hydra writes ``<run>/hydra/backend/dsg.json`` next to ``<run>/image_store``; a
+    ``dsg.json`` directly in the run directory is accepted too.
+    """
+    path = os.path.abspath(dsg_path)
+    parent = os.path.dirname(path)
+    candidates = [os.path.join(parent, "image_store")]
+    if os.path.basename(parent) in ("backend", "frontend") and os.path.basename(
+        os.path.dirname(parent)
+    ) == "hydra":
+        candidates.insert(0, os.path.join(os.path.dirname(os.path.dirname(parent)), "image_store"))
+    for c in candidates:
+        if os.path.isfile(os.path.join(c, "store.sqlite")):
+            return c
+    return None
+
+
+def seed_db(uri: str, auth: tuple, dsg_path: str, image_store="auto") -> int:
     """Replace the database contents with the scene graph at ``dsg_path``.
 
     Wipes everything first, including ``HOLDS`` edges, robot poses and the
     version counter, so it is only for the start of a run. The version is then
     bumped once, so a fresh map is never confused with "no map yet" (0).
+
+    ``image_store``: ``"auto"`` (default) loads the run's ``<run>/image_store``
+    when it exists (see :func:`find_run_image_store`), so Agent/Observation image
+    paths resolve and ``_GraphMetadata {key:'image_store'}.image_store_paths`` tells
+    SAM3 / the console where the keyframes are; a path (or list) uses that store;
+    ``None`` loads the graph without images.
     """
-    load_dsg_to_db(uri, auth, spark_dsg.DynamicSceneGraph.load(dsg_path))
+    if image_store == "auto":
+        image_store = find_run_image_store(dsg_path)
+    load_dsg_to_db(uri, auth, spark_dsg.DynamicSceneGraph.load(dsg_path), image_store=image_store)
     with Neo4jWrapper(uri, auth, atomic_queries=True, print_profiles=False) as db:
         return bump_map_version(db)

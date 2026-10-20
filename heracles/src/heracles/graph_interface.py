@@ -1646,6 +1646,51 @@ def record_change(db, dirty_layers=None, affected_ids=None) -> int:
     return records[0]["v"] if records else 0
 
 
+_MAP_STATE = "_MapState"
+
+
+def get_map_version(db) -> int:
+    """``_MapState.version``: the counter the heracles publisher polls (0 before any bump)."""
+    records, _, _ = db.execute(f"MATCH (m:{_MAP_STATE}) RETURN m.version AS v")
+    return int(records[0]["v"]) if records and records[0]["v"] is not None else 0
+
+
+def bump_map_version(db) -> int:
+    """Increment ``_MapState.version`` (heracles_ros publisher republishes within its
+    ``version_poll_period_s``) and return the new value."""
+    records, _, _ = db.execute(
+        f"MERGE (m:{_MAP_STATE}) "
+        "SET m.version = coalesce(m.version, 0) + 1 "
+        "RETURN m.version AS v"
+    )
+    return int(records[0]["v"])
+
+
+def notify_map_change(db, dirty_layers=None, affected_ids=None) -> tuple:
+    """Tell every reader that the map changed: bump BOTH version counters at once.
+
+    * ``_State {key:'global'}.version`` (+ ``dirty_layers`` / ``affected_ids``, see
+      :func:`record_change`) -- watched by the web console and viz agents.
+    * ``_MapState.version`` (see :func:`bump_map_version`) -- polled by the heracles
+      publisher, which republishes Neo4j -> DSG as soon as it changes (planners wait on it).
+
+    Every Neo4j map writer should call this after its write. One statement, so both
+    counters move together. Returns ``(state_version, map_version)``.
+    """
+    records, _, _ = db.execute(
+        "MERGE (s:_State {key: 'global'}) "
+        "ON CREATE SET s.version = 1 "
+        "ON MATCH SET s.version = s.version + 1 "
+        "SET s.dirty_layers = $dl, s.affected_ids = $ai "
+        f"WITH s MERGE (m:{_MAP_STATE}) "
+        "SET m.version = coalesce(m.version, 0) + 1 "
+        "RETURN s.version AS sv, m.version AS mv",
+        dl=list(dirty_layers or []),
+        ai=list(affected_ids or []),
+    )
+    return int(records[0]["sv"]), int(records[0]["mv"])
+
+
 def read_change(db):
     """Return ``(version, dirty_layers, affected_ids)`` from ``_State``.
 
