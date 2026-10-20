@@ -5,9 +5,11 @@ Verifies that loading a DSG into Neo4j via heracles and reconstructing it
 preserves node data for both old and new scene graph formats.
 
 These tests require:
-- Neo4j running on localhost:7687 with credentials neo4j/neo4j_pw
+- A disposable Neo4j instance (these tests clear its contents). Configure it
+  with HERACLES_TEST_NEO4J_URI / HERACLES_TEST_NEO4J_PASSWORD.
 - The old example DSG at heracles/examples/scene_graphs/example_dsg.json
-- Optionally, the new DSG (set NEW_DSG_PATH env var or skip)
+- Optionally, a new DSG with TravNodeAttributes and KhronosObjectAttributes
+  (set HERACLES_TEST_NEW_DSG or skip)
 """
 
 import os
@@ -23,6 +25,7 @@ from heracles.graph_interface import (
     db_to_spark_dsg,
     get_layer_nodes,
     initialize_db,
+    node_to_dict,
     spark_dsg_to_db,
 )
 from heracles.query_interface import Neo4jWrapper
@@ -47,8 +50,8 @@ NEW_DSG_PATH = os.environ.get(
     ),
 )
 
-NEO4J_URI = "neo4j://127.0.0.1:7687"
-NEO4J_AUTH = ("neo4j", "neo4j_pw")
+NEO4J_URI = os.environ.get("HERACLES_TEST_NEO4J_URI", "neo4j://127.0.0.1:7687")
+NEO4J_AUTH = ("neo4j", os.environ.get("HERACLES_TEST_NEO4J_PASSWORD", "neo4j_pw"))
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +226,8 @@ class TestNewDsgRoundtrip:
 
         sample = nodes[0]
         assert sample["attr_type"] == "KhronosObjectAttributes"
-        assert "bbox_x" in sample
+        assert "bbox_center" in sample
+        assert "bbox_dim" in sample
         assert "color_r" in sample
         assert "first_observed_ns" in sample
         # KhronosObjectAttributes has list timestamps
@@ -231,17 +235,92 @@ class TestNewDsgRoundtrip:
 
     def test_node_counts(self, db):
         """Correct node counts for the new DSG."""
-        _load_and_push(db, NEW_DSG_PATH)
+        original, _, _ = _load_and_push(db, NEW_DSG_PATH)
 
         objects, _, _ = get_layer_nodes(db, constants.OBJECTS)
         mesh_places, _, _ = get_layer_nodes(db, constants.MESH_PLACES)
-        assert len(objects) == 14
-        assert len(mesh_places) == 160
+        assert (
+            len(objects) == original.get_layer(spark_dsg.DsgLayers.OBJECTS).num_nodes()
+        )
+        assert (
+            len(mesh_places)
+            == original.get_layer(spark_dsg.DsgLayers.MESH_PLACES).num_nodes()
+        )
 
 
 # ---------------------------------------------------------------------------
 # Attr type required test
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "dataset_env", ["HERACLES_TEST_PENN_DSG", "HERACLES_TEST_WEST_POINT_DSG"]
+)
+def test_external_scene_graph_roundtrip(db, dataset_env):
+    path = os.environ.get(dataset_env)
+    if not path:
+        pytest.skip(f"Set {dataset_env} to a representative scene graph")
+    original, _, _ = _load_and_push(db, path)
+    reconstructed = db_to_spark_dsg(db)
+    static_ids = set()
+    for layer_name, old_id in [
+        (spark_dsg.DsgLayers.OBJECTS, 2),
+        (spark_dsg.DsgLayers.PLACES, 3),
+        (spark_dsg.DsgLayers.ROOMS, 4),
+        (spark_dsg.DsgLayers.BUILDINGS, 5),
+        (spark_dsg.DsgLayers.MESH_PLACES, 20),
+    ]:
+        try:
+            layer = original.get_layer(layer_name)
+        except IndexError:
+            # Older files name mesh places by layer 20 instead of MESH_PLACES.
+            layer = original.get_layer(old_id)
+        before = {n.id.value: n.attributes for n in layer.nodes}
+        after = {
+            n.id.value: n.attributes for n in reconstructed.get_layer(layer_name).nodes
+        }
+        assert before.keys() == after.keys()
+        static_ids.update(before)
+        for node_id, attrs in before.items():
+            other = after[node_id]
+            assert type(attrs) is type(other)
+            np.testing.assert_allclose(attrs.position, other.position)
+            if hasattr(attrs, "semantic_label"):
+                assert attrs.semantic_label == other.semantic_label
+            if hasattr(attrs, "bounding_box") and attrs.bounding_box.is_valid():
+                np.testing.assert_allclose(
+                    attrs.bounding_box.dimensions, other.bounding_box.dimensions
+                )
+                np.testing.assert_allclose(
+                    attrs.bounding_box.world_P_center, other.bounding_box.world_P_center
+                )
+
+    # Dynamic agent trajectories are outside Heracles' exported static graph.
+    before_edges = {
+        tuple(sorted((e.source, e.target)))
+        for e in original.edges
+        if e.source in static_ids and e.target in static_ids
+    }
+    after_edges = {tuple(sorted((e.source, e.target))) for e in reconstructed.edges}
+    assert before_edges == after_edges
+
+
+@pytest.mark.parametrize("semantic_label", [0, 1, 2])
+def test_room_label_without_labelspace_is_preserved(semantic_label):
+    graph = spark_dsg.DynamicSceneGraph()
+    attrs = spark_dsg.RoomNodeAttributes()
+    attrs.semantic_label = semantic_label
+    symbol = spark_dsg.NodeSymbol("R", 0).value
+    graph.add_node(spark_dsg.DsgLayers.ROOMS, symbol, attrs)
+    record = node_to_dict(graph.get_node(symbol))
+
+    restored = db_record_to_spark_attrs(record, {}, {})
+    assert restored.semantic_label == semantic_label
+
+    # A later class edit in Neo4j must still override the original numeric ID.
+    record["class"] = "edited_room"
+    restored = db_record_to_spark_attrs(record, {}, {"edited_room": 9})
+    assert restored.semantic_label == 9
 
 
 class TestAttrTypeRequired:

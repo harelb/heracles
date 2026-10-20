@@ -1,4 +1,8 @@
 bool is_holding
 string id
+# Where the object was put down, in the map frame. Only read on release, and
+# only when has_position is set; otherwise the robot's position is used.
+bool has_position
+geometry_msgs/Point position
 ---
 bool success

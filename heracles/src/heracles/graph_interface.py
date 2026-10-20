@@ -154,6 +154,8 @@ def node_to_dict(node, object_labelspace=None, room_labelspace=None):
 
     # SemanticNodeAttributes fields (optional).
     if hasattr(attrs, "semantic_label"):
+        # Preserve the ID even when this graph has no labelspace for the layer.
+        d["semantic_label"] = int(attrs.semantic_label)
         ls = (
             room_labelspace
             if isinstance(attrs, spark_dsg.RoomNodeAttributes)
@@ -1364,6 +1366,10 @@ def db_record_to_spark_attrs(record, object_labelspace, room_labelspace):
     # Name (SemanticNodeAttributes).
     if hasattr(attrs, "name") and "name" in record:
         attrs.name = record["name"]
+
+    # Keep unmapped IDs; an explicitly mapped class still takes precedence.
+    if hasattr(attrs, "semantic_label") and "semantic_label" in record:
+        attrs.semantic_label = int(record["semantic_label"])
 
     # Semantic label → class (SemanticNodeAttributes).
     if hasattr(attrs, "semantic_label") and "class" in record:
