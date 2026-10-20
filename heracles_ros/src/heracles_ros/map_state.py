@@ -93,4 +93,15 @@ def seed_db(uri: str, auth: tuple, dsg_path: str, image_store="auto") -> int:
         image_store = find_run_image_store(dsg_path)
     load_dsg_to_db(uri, auth, spark_dsg.DynamicSceneGraph.load(dsg_path), image_store=image_store)
     with Neo4jWrapper(uri, auth, atomic_queries=True, print_profiles=False) as db:
+        # the graph is stored without its mesh: record the run's mesh file so viewers
+        # (e.g. the web console's Neo4j source) can draw it
+        mesh = find_run_mesh(dsg_path)
+        if mesh is not None:
+            graph_interface.store_mesh_path(db, mesh)
         return bump_map_version(db)
+
+
+def find_run_mesh(dsg_path: str) -> Optional[str]:
+    """The mesh hydra saved next to ``dsg_path`` (``mesh.ply``), or ``None``."""
+    path = os.path.join(os.path.dirname(os.path.abspath(dsg_path)), "mesh.ply")
+    return path if os.path.isfile(path) else None

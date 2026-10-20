@@ -79,3 +79,15 @@ def test_seed_db_records_image_store(tmp_path):
         assert not db.query("MATCH (m:_GraphMetadata {key:'image_store'}) RETURN m")
     finally:
         db.close()
+
+
+def test_find_run_mesh(tmp_path):
+    from heracles_ros.map_state import find_run_mesh
+
+    backend = tmp_path / "hydra" / "backend"
+    backend.mkdir(parents=True)
+    dsg = backend / "dsg.json"
+    dsg.write_text("{}")
+    assert find_run_mesh(str(dsg)) is None
+    (backend / "mesh.ply").write_text("ply")
+    assert find_run_mesh(str(dsg)) == str(backend / "mesh.ply")
