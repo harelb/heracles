@@ -323,6 +323,24 @@ def test_room_label_without_labelspace_is_preserved(semantic_label):
     assert restored.semantic_label == 9
 
 
+def test_semantic_region_keeps_its_name():
+    """Open-vocabulary regions (hydra's regions functor) are SemanticNodeAttributes:
+    their name (the region label) must survive Neo4j -> spark_dsg."""
+    graph = spark_dsg.DynamicSceneGraph()
+    attrs = spark_dsg.SemanticNodeAttributes()
+    attrs.name = "parking lot"
+    attrs.semantic_label = 3
+    symbol = spark_dsg.NodeSymbol("r", 0).value
+    graph.add_node(spark_dsg.DsgLayers.ROOMS, symbol, attrs)
+    record = node_to_dict(graph.get_node(symbol))
+    assert record["attr_type"] == "SemanticNodeAttributes"
+
+    restored = db_record_to_spark_attrs(record, {}, {})
+    assert isinstance(restored, spark_dsg.SemanticNodeAttributes)
+    assert restored.name == "parking lot"
+    assert restored.semantic_label == 3
+
+
 class TestAttrTypeRequired:
     def test_missing_attr_type_raises(self, db):
         """Reconstruction raises ValueError if attr_type is missing."""

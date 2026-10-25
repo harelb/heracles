@@ -58,6 +58,8 @@ ATTR_TYPE_REGISTRY = {
     "PlaceNodeAttributes": spark_dsg.PlaceNodeAttributes,
     "Place2dNodeAttributes": spark_dsg.Place2dNodeAttributes,
     "RoomNodeAttributes": spark_dsg.RoomNodeAttributes,
+    # e.g. hydra's open-vocabulary regions: name, label, color, semantic feature
+    "SemanticNodeAttributes": spark_dsg.SemanticNodeAttributes,
     "NodeAttributes": spark_dsg.NodeAttributes,
 }
 
@@ -162,7 +164,11 @@ def node_to_dict(node, object_labelspace=None, room_labelspace=None):
             else object_labelspace
         )
         label_key = str(attrs.semantic_label)
-        if ls and label_key in ls:
+        if type(attrs) is spark_dsg.SemanticNodeAttributes:
+            # hydra's open-vocabulary regions: semantic_label indexes the region
+            # prompts, not a labelspace; the matched prompt is the node's name
+            pass
+        elif ls and label_key in ls:
             d["class"] = ls[label_key]
         else:
             logger.warning(
