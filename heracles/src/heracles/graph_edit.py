@@ -1115,7 +1115,8 @@ def edits_since(db, revision: int, *, database: str = "neo4j") -> int:
 
 
 def regions(db, *, database: str = "neo4j") -> list[dict]:
-    """Room nodes with name, class, boundary polygon and member counts."""
+    """Room nodes with name, class, boundary polygon and member counts. ``polygon_source``:
+    "drawn" (the node's boundary) or "members" (derived from the ground its places cover)."""
     recs, _, _ = _driver(db).execute_query(
         f"MATCH (r:{constants.ROOMS}) OPTIONAL MATCH (r)-[:CONTAINS]->(c) "
         "WITH r, [l IN labels(c) WHERE l IN $labels][0] AS lab, count(c) AS n "
@@ -1128,13 +1129,15 @@ def regions(db, *, database: str = "neo4j") -> list[dict]:
     for r in recs:
         members = {lab: n for lab, n in r["members"] if lab}
         polygon = [p[:2] for p in plain(r["boundary"])] if r["boundary"] else None
+        polygon_source = "drawn" if polygon else None
         if polygon is None:  # mapped regions carry no boundary: the ground their places cover
             if derived is None:
                 derived = member_footprints(db, database=database)
             polygon = derived.get(r["symbol"])
+            polygon_source = "members" if polygon else None
         out.append({
             "symbol": r["symbol"], "name": r["name"], "class": r["class"],
-            "center": plain(r["center"]), "polygon": polygon,
+            "center": plain(r["center"]), "polygon": polygon, "polygon_source": polygon_source,
             "source": r["source"], "members": members,
         })  # fmt: skip
     return out
