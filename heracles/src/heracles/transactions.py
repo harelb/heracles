@@ -24,12 +24,16 @@ class GraphUnitOfWork:
         expected_revision: int,
         mutation_id: str,
         provenance: Mapping[str, Any],
+        annotations: Mapping[str, Any] | None = None,
     ):
         self.driver = driver
         self.database = database
         self.expected_revision = int(expected_revision)
         self.mutation_id = str(mutation_id)
         self.provenance = dict(provenance)
+        # Extra scalar properties for the GraphMutation audit node (e.g. a map
+        # edit's kind, summary and inverse ops); settable until commit().
+        self.annotations: dict[str, Any] = dict(annotations or {})
         self._session = None
         self._transaction = None
         self._current_revision: int | None = None
@@ -114,12 +118,14 @@ class GraphUnitOfWork:
             "CREATE (m:GraphMutation {mutation_id:$mutation_id, "
             "previous_revision:$previous_revision, revision:$revision, "
             "provenance_json:$provenance_json, committed_at:datetime()}) "
+            "SET m += $annotations "
             "CREATE (m)-[:ADVANCED]->(s)",
             key=self.STATE_KEY,
             revision=revision,
             previous_revision=self.current_revision,
             mutation_id=self.mutation_id,
             provenance_json=json.dumps(self.provenance, sort_keys=True, default=str),
+            annotations=self.annotations,
         )
         self._transaction.commit()
         self._transaction = None
