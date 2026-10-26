@@ -671,6 +671,7 @@ def insert_observations_to_db(db, observations):
         o.rgb_path = coalesce(obs.rgb_path, o.rgb_path),
         o.depth_path = coalesce(obs.depth_path, o.depth_path),
         o.mask_path = coalesce(obs.mask_path, o.mask_path),
+        o.mask_rle = coalesce(obs.mask_rle, o.mask_rle),
         o.bbox_2d = coalesce(obs.bbox_2d, o.bbox_2d),
         o.kept = coalesce(obs.kept, o.kept),
         o.bbox_2d_min_x = obs.bbox_2d_min_x,
@@ -835,6 +836,8 @@ def _observation_dicts(obj_symbol, observations):
             "depth_path": _path_or_none(ob.depth_path),
             "mask_path": _path_or_none(ob.mask_path),
             "mask_file": os.path.basename(str(ob.mask_path)) if ob.mask_path else None,
+            # the store keeps the RLE of every observation; the PNG only for the kept ones
+            "mask_rle": ob.mask_rle or None,
             "score": float(ob.score),
             "kept": bool(ob.kept),
         }

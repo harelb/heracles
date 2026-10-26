@@ -67,7 +67,7 @@ def build_store(root, obj1=OBJ1, obj2=OBJ2):
     w.record_merges({obj2: obj1})
     mask_png = _img(src / "m.png", "L")
     w.add_observation(7, kf0, bbox2d=(1, 2, 5, 6), score=0.9, kept=True, mask_path=mask_png)
-    w.add_observation(8, of, bbox2d=(0, 0, 3, 3), score=0.4, kept=False)
+    w.add_observation(8, of, bbox2d=(0, 0, 3, 3), score=0.4, kept=False, mask_rle=[2, 3, 4])
     w.close()
     return store_dir
 

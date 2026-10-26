@@ -86,6 +86,11 @@ def test_observation_dicts_merged_children_and_collisions(store):
     assert best["bbox_2d"] == [1, 2, 5, 6] and best["mask_file"] == best["mask_path"].rsplit("/", 1)[-1]
     assert best["mask_path"].endswith(".png") and best["rgb_path"].endswith("100_rgb.jpg")
     assert dicts[1]["mask_path"] is None and dicts[1]["mask_file"] is None
+    # a non-kept observation has no PNG, but its RLE mask still goes to Neo4j
+    assert dicts[1]["mask_rle"] == obs[1].mask_rle and obs[1].mask_rle
+    db = _CaptureDB()
+    gi.insert_observations_to_db(db, dicts)
+    assert "o.mask_rle = coalesce(obs.mask_rle, o.mask_rle)" in db.calls[0][0]
     # Same object+timestamp twice -> second symbol disambiguated by obs_id.
     twice = _observation_dicts("O1", [obs[0], obs[0]])
     assert twice[0]["nodeSymbol"] != twice[1]["nodeSymbol"]
