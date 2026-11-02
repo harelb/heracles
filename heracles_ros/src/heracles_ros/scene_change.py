@@ -3,7 +3,8 @@
 Change detection reports objects that moved, appeared or disappeared; these
 functions write them into Neo4j, the one map every planner reads. Each change
 comes back as an "applied" record -- what the map now says, including where
-the object was before -- or None when there was nothing to apply.
+the object was before and its class -- or None when there was nothing to apply.
+The class is read before a removal, since afterwards the map no longer has it.
 
 An object a robot is holding is not moved by an observation: the robot is
 carrying it, and the holding rule keeps it on the robot.
@@ -32,6 +33,13 @@ def object_center(db, symbol) -> Optional[tuple]:
         return None
     c = rows[0]["c"]
     return (c.x, c.y, c.z)
+
+
+def object_class(db, symbol) -> str:
+    rows = db.execute(
+        "MATCH (o:Object {nodeSymbol: $s}) RETURN o.class AS c", **{"s": symbol}
+    )[0]
+    return (rows[0]["c"] or "") if rows else ""
 
 
 def holder_of(db, symbol) -> Optional[str]:
@@ -87,17 +95,22 @@ def move_object(db, symbol, xyz) -> Optional[dict]:
     if holder_of(db, symbol) is not None:
         return None
     _set_position(db, symbol, xyz)
-    return {"kind": MOVED, "symbol": symbol, "old": old, "new": tuple(xyz)}
+    return {
+        "kind": MOVED,
+        "symbol": symbol,
+        "label": object_class(db, symbol),
+        "old": old,
+        "new": tuple(xyz),
+    }
 
 
 def remove_object(db, symbol) -> Optional[dict]:
     old = object_center(db, symbol)
     if old is None:
         return None
-    db.execute(
-        "MATCH (o:Object {nodeSymbol: $s}) DETACH DELETE o", **{"s": symbol}
-    )
-    return {"kind": REMOVED, "symbol": symbol, "old": old, "new": None}
+    label = object_class(db, symbol)
+    db.execute("MATCH (o:Object {nodeSymbol: $s}) DETACH DELETE o", **{"s": symbol})
+    return {"kind": REMOVED, "symbol": symbol, "label": label, "old": old, "new": None}
 
 
 def add_object(db, symbol, label, xyz) -> Optional[dict]:
@@ -121,11 +134,26 @@ def add_object(db, symbol, label, xyz) -> Optional[dict]:
             first_observed_ns: [$now], last_observed_ns: [$now]
         })
         """,
-        **{"s": symbol, "label": label or "unknown", "x": x, "y": y, "z": z,
-                     "sx": sx, "sy": sy, "sz": sz, "now": now},
+        **{
+            "s": symbol,
+            "label": label or "unknown",
+            "x": x,
+            "y": y,
+            "z": z,
+            "sx": sx,
+            "sy": sy,
+            "sz": sz,
+            "now": now,
+        },
     )
     _relink_to_nearest_place(db, symbol)
-    return {"kind": ADDED, "symbol": symbol, "old": None, "new": (x, y, z)}
+    return {
+        "kind": ADDED,
+        "symbol": symbol,
+        "label": label or "unknown",
+        "old": None,
+        "new": (x, y, z),
+    }
 
 
 def apply_changes(db, changes) -> List[dict]:

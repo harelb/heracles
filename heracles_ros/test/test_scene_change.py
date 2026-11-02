@@ -96,3 +96,42 @@ def test_seed_resets_versions_then_writes_bump_them(db):
     assert bump_map_version(db) == v + 1
     seed_db(URI, AUTH, DSG_PATH)
     assert get_map_version(db) == 1
+
+
+class _FakeDb:
+    """Just enough of Neo4jWrapper.execute for remove_object, without a database."""
+
+    def __init__(self, objects):
+        self.objects = objects  # symbol -> (class, (x, y, z))
+
+    def execute(self, query, s=None, **_):
+        from types import SimpleNamespace as NS
+
+        if "DETACH DELETE" in query:
+            self.objects.pop(s, None)
+            return [[]]
+        if s not in self.objects or "HOLDS" in query:
+            return [[]]
+        label, (x, y, z) = self.objects[s]
+        if "o.class" in query:
+            return [[{"c": label}]]
+        return [[{"c": NS(x=x, y=y, z=z)}]]
+
+
+def test_a_removal_reports_the_class_the_map_had():
+    from heracles_ros.scene_change import remove_object
+
+    fake = _FakeDb({"O16": ("cone", (1.0, 2.0, 0.0))})
+    applied = remove_object(fake, "O16")
+    assert applied["label"] == "cone" and applied["old"] == (1.0, 2.0, 0.0)
+    assert "O16" not in fake.objects  # read before the delete, gone after
+
+
+def test_applied_message_carries_the_class():
+    from builtin_interfaces.msg import Time
+
+    msg = applied_msg("awcd/hamilton", 3, [
+        {"kind": REMOVED, "symbol": "O16", "label": "cone", "old": (1.0, 2.0, 0.0), "new": None},
+        {"kind": MOVED, "symbol": "O5", "old": (1.0, 2.0, 0.0), "new": (3.0, 4.0, 0.0)},
+    ], Time())
+    assert [c.semantic_label for c in msg.changes] == ["cone", ""]  # placements carry none

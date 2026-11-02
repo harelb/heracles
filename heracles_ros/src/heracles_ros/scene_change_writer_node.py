@@ -21,7 +21,11 @@ from heracles_ros.scene_change import KIND_NAMES, apply_changes
 
 
 def to_point(xyz):
-    return Point() if xyz is None else Point(x=float(xyz[0]), y=float(xyz[1]), z=float(xyz[2]))
+    return (
+        Point()
+        if xyz is None
+        else Point(x=float(xyz[0]), y=float(xyz[1]), z=float(xyz[2]))
+    )
 
 
 def applied_msg(source, version, applied, stamp):
@@ -34,6 +38,7 @@ def applied_msg(source, version, applied, stamp):
         c = SceneChange()
         c.kind = a["kind"]
         c.symbol = a["symbol"]
+        c.semantic_label = a.get("label") or ""
         c.old_position = to_point(a["old"])
         c.new_position = to_point(a["new"])
         c.confidence = 1.0
@@ -55,21 +60,29 @@ class SceneChangeWriter(Node):
         assert ip and port > 0, "Please set the database IP and port"
         self.db = Neo4jWrapper(
             f"neo4j://{ip}:{port}",
-            (self.get_parameter("heracles_neo4j_user").value,
-             self.get_parameter("heracles_neo4j_pass").value),
+            (
+                self.get_parameter("heracles_neo4j_user").value,
+                self.get_parameter("heracles_neo4j_pass").value,
+            ),
             atomic_queries=True,
             print_profiles=False,
         )
         self.db.connect()
         self.min_confidence = float(self.get_parameter("min_confidence").value)
-        self.applied_pub = self.create_publisher(SceneChangeMsg, "~/scene_changes_applied", 10)
+        self.applied_pub = self.create_publisher(
+            SceneChangeMsg, "~/scene_changes_applied", 10
+        )
         self.create_subscription(SceneChangeMsg, "~/scene_changes", self.on_changes, 10)
         self.get_logger().info("Writing scene changes from ~/scene_changes into Neo4j")
 
     def on_changes(self, msg: SceneChangeMsg):
         wanted = [
-            (c.kind, c.symbol.strip(), c.semantic_label.strip(),
-             (c.new_position.x, c.new_position.y, c.new_position.z))
+            (
+                c.kind,
+                c.symbol.strip(),
+                c.semantic_label.strip(),
+                (c.new_position.x, c.new_position.y, c.new_position.z),
+            )
             for c in msg.changes
             if c.confidence >= self.min_confidence
         ]
