@@ -101,8 +101,9 @@ def test_seed_resets_versions_then_writes_bump_them(db):
 class _FakeDb:
     """Just enough of Neo4jWrapper.execute for remove_object, without a database."""
 
-    def __init__(self, objects):
+    def __init__(self, objects, held=()):
         self.objects = objects  # symbol -> (class, (x, y, z))
+        self.held = set(held)
 
     def execute(self, query, s=None, **_):
         from types import SimpleNamespace as NS
@@ -110,7 +111,9 @@ class _FakeDb:
         if "DETACH DELETE" in query:
             self.objects.pop(s, None)
             return [[]]
-        if s not in self.objects or "HOLDS" in query:
+        if "HOLDS" in query:
+            return [[{"r": "hilbert"}]] if s in self.held else [[]]
+        if s not in self.objects:
             return [[]]
         label, (x, y, z) = self.objects[s]
         if "o.class" in query:
@@ -135,3 +138,12 @@ def test_applied_message_carries_the_class():
         {"kind": MOVED, "symbol": "O5", "old": (1.0, 2.0, 0.0), "new": (3.0, 4.0, 0.0)},
     ], Time())
     assert [c.semantic_label for c in msg.changes] == ["cone", ""]  # placements carry none
+
+
+def test_a_held_object_is_not_removed():
+    from heracles_ros.scene_change import remove_object
+
+    # A robot carried O16 away: change detection sees its old spot empty.
+    fake = _FakeDb({"O16": ("trash", (1.0, 2.0, 0.0))}, held={"O16"})
+    assert remove_object(fake, "O16") is None
+    assert "O16" in fake.objects

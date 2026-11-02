@@ -6,8 +6,9 @@ comes back as an "applied" record -- what the map now says, including where
 the object was before and its class -- or None when there was nothing to apply.
 The class is read before a removal, since afterwards the map no longer has it.
 
-An object a robot is holding is not moved by an observation: the robot is
-carrying it, and the holding rule keeps it on the robot.
+An object a robot is holding is not moved or removed by an observation: the
+robot is carrying it, and the holding rule keeps it on the robot. Change
+detection does report it removed, since it is gone from where it lay.
 
 Positions are written everywhere the map keeps them: center and bbox_center
 (what the published scene graph reads) and pos_x / pos_y / pos_z (what Cypher
@@ -107,6 +108,8 @@ def move_object(db, symbol, xyz) -> Optional[dict]:
 def remove_object(db, symbol) -> Optional[dict]:
     old = object_center(db, symbol)
     if old is None:
+        return None
+    if holder_of(db, symbol) is not None:
         return None
     label = object_class(db, symbol)
     db.execute("MATCH (o:Object {nodeSymbol: $s}) DETACH DELETE o", **{"s": symbol})
