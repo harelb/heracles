@@ -38,7 +38,8 @@ def _T(t):
 
 
 def build_store(root, obj1=OBJ1, obj2=OBJ2):
-    """Store: 2 keyframes (a0, a1), 2 sub-keyframes on a1, 2 tracks -> O1 (O2 merged)."""
+    """Store: the own keyframes of a0 and a1, 2 other keyframes (one off a1, one
+    unanchored), 2 tracks -> O1 (O2 merged)."""
     root = pathlib.Path(root)
     store_dir = root / "image_store"
     src = root / "src"
@@ -53,11 +54,11 @@ def build_store(root, obj1=OBJ1, obj2=OBJ2):
         sid, 200, kind=FrameKind.KEYFRAME, world_T_body_odom=_T((2, 0, 0)),
         rgb=_img(src / "kf1.jpg"), anchor_node_id=AGENT1, **kw)
     w.add_frame_ref(
-        sid, 150, kind=FrameKind.SUBKEYFRAME, world_T_body_odom=_T((9, 9, 9)),
+        sid, 150, kind=FrameKind.KEYFRAME, world_T_body_odom=_T((9, 9, 9)),
         rgb=_img(src / "s0.jpg"), anchor_node_id=AGENT1,
         anchor_T_body=_T((0.5, 0, 0)), **kw)
     w.add_frame_ref(
-        sid, 160, kind=FrameKind.SUBKEYFRAME, world_T_body_odom=_T((3, 3, 3)),
+        sid, 160, kind=FrameKind.KEYFRAME, world_T_body_odom=_T((3, 3, 3)),
         rgb=_img(src / "s1.jpg"), **kw)  # unanchored
     of = w.add_frame_ref(
         sid, 100 + 1, kind=FrameKind.OBSERVATION, world_T_body_odom=_T((1, 0, 0)),

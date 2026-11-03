@@ -214,10 +214,10 @@ def test_attach_camera_calibs(db, tmp_path):
 
 
 def _subkf_symbols(store):
-    from hydra_image_store import FrameKind
-    from heracles.graph_interface import subkeyframe_symbol
+    from heracles.graph_interface import split_keyframes, subkeyframe_symbol
+    from image_store_fixture import build_dsg
 
-    frames = store.frames(kind=FrameKind.SUBKEYFRAME)
+    frames = split_keyframes(build_dsg(), store)[1]
     frames.sort(key=lambda f: f.anchor_node_id is None)  # anchored first
     return [subkeyframe_symbol(f.frame_id) for f in frames]
 
