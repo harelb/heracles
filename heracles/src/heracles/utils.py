@@ -59,7 +59,7 @@ def load_dsg_to_db(neo4j_uri, neo4j_creds, scene_graph, image_store=None):
         Image store directory (or one per robot) written by Hydra. When provided,
         Observation, SubKeyframe and CameraCalib nodes are created from it and
         Agent nodes get their keyframe image paths. A legacy run directory
-        raises a clear error pointing at ``hydra-image-store import-legacy``.
+        raises a clear error pointing at ``hydra-image-store-adt4 import-legacy``.
     """
     # Set the layer id to layer name mappings
     spark_layer_id_to_heracles_layer_str = {

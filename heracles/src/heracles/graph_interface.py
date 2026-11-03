@@ -443,11 +443,21 @@ def open_image_store(image_store):
             raise ImageStoreError(
                 f"{base} is not an image store (no store.sqlite). If it is a legacy "
                 "run directory with image folders, convert it first: "
-                f"`hydra-image-store import-legacy --run-dir {base} --out <store_dir> "
+                f"`hydra-image-store-adt4 import-legacy --run-dir {base} --out <store_dir> "
                 "--dsg <dsg.json>`, then pass the new store as `image_store`."
             )
         resolved.append(found)
-    return ImageStore.open(*resolved)
+    store = ImageStore.open(*resolved)
+    try:
+        store.info()  # raises on frame kinds the reader does not know
+    except ValueError as e:
+        store.close()
+        raise ImageStoreError(
+            f"{e}. An image store written before sub-keyframes were dropped must be "
+            f"converted first (once, it rewrites the store): "
+            f"`hydra-image-store-adt4 convert {' '.join(resolved)}`"
+        ) from e
+    return store
 
 
 def _store_paths(store):
@@ -456,6 +466,80 @@ def _store_paths(store):
 
 def _node_symbol_str(node_id):
     return spark_dsg.NodeSymbol(int(node_id)).str(True)
+
+
+# An agent node's own keyframe: the keyframe anchored to it within this time of the
+# node's stamp (``ImageStore.agent_frame``'s default).
+AGENT_FRAME_MAX_DT_NS = 50_000_000
+# Without a node stamp: the anchored keyframe taken at the node's own pose
+# (anchor_T_body is the identity for a keyframe taken at the node's stamp).
+_IDENTITY_ATOL = 1e-3
+
+
+def _agent_stamp_ns(attrs):
+    """Agent node stamp in ns, None when unset (the binding defaults it to 0)."""
+    ts = getattr(attrs, "timestamp", None)
+    if ts is None:
+        return None
+    ns = (ts // datetime.timedelta(microseconds=1)) * 1000
+    return ns if ns > 0 else None
+
+
+def _agent_stamps(G):
+    """``agent node id -> stamp ns`` for every agent node of ``G`` with a stamp."""
+    out = {}
+    if G is None:
+        return out
+    agents_layer = spark_dsg.DsgLayers.name_to_layer_id("AGENTS").layer  # == 2
+    for key in G.layer_keys:
+        if key.layer != agents_layer or key.partition == 0:
+            continue
+        for a in G.get_layer(key.layer, key.partition).nodes:
+            if isinstance(a.attributes, spark_dsg.AgentNodeAttributes):
+                ts = _agent_stamp_ns(a.attributes)
+                if ts is not None:
+                    out[int(a.id.value)] = ts
+    return out
+
+
+def _offset(frame):
+    """Translation / rotation size of a frame's anchor_T_body (None = identity)."""
+    if frame.anchor_T_body is None:
+        return 0.0
+    return float(np.max(np.abs(np.asarray(frame.anchor_T_body) - np.eye(4))))
+
+
+def split_keyframes(G, store):
+    """Split the store's keyframes into the agents' own keyframes and the others.
+
+    Every keyframe archive is a ``FrameKind.KEYFRAME`` anchored to the agent node
+    nearest in time. An agent node's own keyframe is the one anchored to it within
+    ``AGENT_FRAME_MAX_DT_NS`` of the node's stamp (``ImageStore.agent_frame``); for an
+    agent without a stamp in ``G``, the anchored keyframe whose ``anchor_T_body`` is
+    the identity. Returns ``(own, others)``: ``{agent node id: Frame}`` and the list
+    of the other keyframes (the ``SubKeyframe`` nodes), both in time order.
+    """
+    from hydra_image_store import FrameKind
+
+    frames = store.frames(kind=FrameKind.KEYFRAME)
+    stamps = _agent_stamps(G)
+    by_anchor = {}
+    for f in frames:
+        if f.anchor_node_id is not None:
+            by_anchor.setdefault(int(f.anchor_node_id), []).append(f)
+    own = {}
+    for a, fs in by_anchor.items():
+        ts = stamps.get(a)
+        if ts is not None:
+            best = min(fs, key=lambda f: (abs(f.timestamp_ns - ts), f.timestamp_ns, f.frame_id))
+            if abs(best.timestamp_ns - ts) <= AGENT_FRAME_MAX_DT_NS:
+                own[a] = best
+            continue
+        cands = [f for f in fs if _offset(f) < _IDENTITY_ATOL]
+        if cands:
+            own[a] = min(cands, key=lambda f: (_offset(f), f.timestamp_ns, f.frame_id))
+    own_ids = {f.frame_id for f in own.values()}
+    return own, [f for f in frames if f.frame_id not in own_ids]
 
 
 def subkeyframe_symbol(frame_id):
@@ -494,16 +578,16 @@ def agent_to_dict(agent):
     # The python binding exposes `timestamp` as datetime.timedelta (chrono
     # caster) and DEFAULTS to timedelta(0) when unset; treat 0 as unset (the
     # image store's keyframe frame supplies the timestamp then).
-    ts = getattr(attrs, "timestamp", None)
-    ts_ns = (ts // datetime.timedelta(microseconds=1)) * 1000 if ts is not None else 0
-    if ts_ns > 0:
+    ts_ns = _agent_stamp_ns(attrs)
+    if ts_ns is not None:
         d["timestamp_ns"] = ts_ns
 
     return d
 
 
 def subkeyframe_to_dict(frame, pose):
-    """One SubKeyframe row from a store sub-keyframe ``Frame``.
+    """One SubKeyframe row from a store keyframe ``Frame`` that is not an agent's
+    own keyframe (see :func:`split_keyframes`).
 
     ``pose`` is the 4x4 corrected world_T_body (anchor pose composed with the stored
     anchor_T_body, or odometry when the anchor is unknown).
@@ -562,17 +646,11 @@ def _collect_agents(G, store=None):
     AgentNodeAttributes type check.
 
     With a ``store``, each agent gets ``frame_id`` / ``rgb_path`` / ``depth_path`` from
-    its keyframe frame (absolute paths), if the store has one; the frame timestamp
-    fills in a missing attribute timestamp.
+    its own keyframe (:func:`split_keyframes`; absolute paths), if the store has one;
+    the frame timestamp is exact and replaces the attribute timestamp.
     """
-    from hydra_image_store import FrameKind  # only reached with a store
-
     agents_layer = spark_dsg.DsgLayers.name_to_layer_id("AGENTS").layer  # == 2
-    keyframes = {}
-    if store is not None:
-        for f in store.frames(kind=FrameKind.KEYFRAME):
-            if f.anchor_node_id is not None:
-                keyframes.setdefault(int(f.anchor_node_id), f)
+    keyframes = split_keyframes(G, store)[0] if store is not None else {}
     agents = []
     for key in G.layer_keys:
         if key.layer != agents_layer or key.partition == 0:
@@ -601,16 +679,15 @@ def add_agents_from_dsg(G, db, store=None):
 
 
 def _collect_subkeyframes(G, store):
-    """SubKeyframe dicts, one per store frame of kind sub-keyframe.
+    """SubKeyframe dicts, one per store keyframe that is not an agent's own keyframe
+    (:func:`split_keyframes`), anchored or not.
 
     The pose is the corrected body pose: the anchor agent's pose in ``G`` composed with
     the stored anchor_T_body (``store.body_pose``), falling back to odometry when the
     anchor is not in the graph.
     """
-    from hydra_image_store import FrameKind
-
     out = []
-    for f in store.frames(kind=FrameKind.SUBKEYFRAME):
+    for f in split_keyframes(G, store)[1]:
         pose, _ = store.body_pose(f, G)
         out.append(subkeyframe_to_dict(f, pose))
     return out
@@ -634,7 +711,8 @@ def insert_subkeyframes_to_db(db, subframes):
 
 
 def add_subkeyframes_from_dsg(G, db, store):
-    """Create ``(:SubKeyframe)-[:ANCHORED_TO]->(:Agent)`` from the store's sub-keyframes."""
+    """Create ``(:SubKeyframe)-[:ANCHORED_TO]->(:Agent)`` from the store's keyframes
+    that are not an agent's own keyframe."""
     if store is None:
         return 0
     subframes = _collect_subkeyframes(G, store)
@@ -756,15 +834,15 @@ def _calib_to_dict(calib):
     }
 
 
-def attach_camera_calibs(db, store):
+def attach_camera_calibs(db, store, G=None):
     """Materialize ``(:CameraCalib)`` nodes from the store's sensors, with
-    ``HAS_CALIB`` edges from every Agent (keyframe frame) and SubKeyframe.
+    ``HAS_CALIB`` edges from every Agent (keyframe frame) and SubKeyframe. ``G``
+    supplies the agent stamps that pick each agent's own keyframe
+    (:func:`split_keyframes`).
 
     ``calib_id`` is the decimal store ``sensor_id``. Returns the number of
     frame->calib edges written.
     """
-    from hydra_image_store import FrameKind
-
     ensure_provenance_indexes(db)
     calibs = [_calib_to_dict(c) for c in store.sensors() if c is not None]
     if not calibs:
@@ -782,14 +860,13 @@ def attach_camera_calibs(db, store):
     )
     known = {c["sensor_id"] for c in calibs}
     agent_pairs, sub_pairs = [], []
-    for f in store.frames(kind=[FrameKind.KEYFRAME, FrameKind.SUBKEYFRAME]):
-        if f.anchor_node_id is None or int(f.sensor_id) not in known:
-            continue
-        cid = str(int(f.sensor_id))
-        if f.kind == FrameKind.KEYFRAME:
-            agent_pairs.append({"ns": _node_symbol_str(f.anchor_node_id), "calib_id": cid})
-        else:
-            sub_pairs.append({"ns": subkeyframe_symbol(f.frame_id), "calib_id": cid})
+    own, others = split_keyframes(G, store)
+    for a, f in own.items():
+        if int(f.sensor_id) in known:
+            agent_pairs.append({"ns": _node_symbol_str(a), "calib_id": str(int(f.sensor_id))})
+    for f in others:
+        if f.anchor_node_id is not None and int(f.sensor_id) in known:
+            sub_pairs.append({"ns": subkeyframe_symbol(f.frame_id), "calib_id": str(int(f.sensor_id))})
     n_edges = 0
     for label, pairs in (
         (constants.AGENTS, agent_pairs),
@@ -992,7 +1069,7 @@ def spark_dsg_to_db(G, db, source_file_path=None, image_store=None, mesh_path=No
     # visibility reasoning is possible from the DB.
     try:
         if store is not None:
-            attach_camera_calibs(db, store)
+            attach_camera_calibs(db, store, G)
         link_observations_to_frames(db)
     except Exception:
         logger.exception("evidence-provenance materialization failed (non-fatal)")

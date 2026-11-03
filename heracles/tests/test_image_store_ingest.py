@@ -42,9 +42,9 @@ def test_open_image_store_accepts_path_list_and_object(tmp_path):
 def test_legacy_run_dir_raises_pointing_at_import_legacy(tmp_path):
     (tmp_path / "agents").mkdir()
     (tmp_path / "images").mkdir()
-    with pytest.raises(gi.ImageStoreError, match="import-legacy"):
+    with pytest.raises(gi.ImageStoreError, match="hydra-image-store-adt4 import-legacy"):
         gi.open_image_store(str(tmp_path))
-    with pytest.raises(gi.ImageStoreError, match="import-legacy"):
+    with pytest.raises(gi.ImageStoreError, match="hydra-image-store-adt4 import-legacy"):
         gi.spark_dsg_to_db(build_dsg(), _CaptureDB(), image_store=str(tmp_path))
 
 
@@ -107,3 +107,41 @@ def test_rot_to_quat_roundtrip():
         ])
         out = rot_to_quat(R)
         assert np.allclose(out, q) or np.allclose(out, -q)
+
+
+def test_agent_stamps_from_the_dsg():
+    import datetime
+
+    G = build_dsg()
+    G.get_node(AGENT1).attributes.timestamp = datetime.timedelta(microseconds=150)
+    assert gi._agent_stamps(G) == {AGENT1: 150_000}  # a0 is unstamped (0)
+
+
+def test_own_keyframe_is_the_one_at_the_agent_stamp(store, monkeypatch):
+    # (the fixture's stamps are a few ns; the DSG binding has us resolution)
+    # a1 stamped at 150 ns: its own frame is the keyframe taken then, the keyframe at
+    # 200 ns (identity anchor_T_body) becomes one of the other keyframes
+    monkeypatch.setattr(gi, "_agent_stamps", lambda G: {AGENT1: 150})
+    own, others = gi.split_keyframes(build_dsg(), store)
+    assert own[AGENT1].timestamp_ns == 150 and own[AGENT0].timestamp_ns == 100
+    assert sorted(f.timestamp_ns for f in others) == [160, 200]
+    # a stamp no keyframe is within 50 ms of: no own frame
+    monkeypatch.setattr(gi, "_agent_stamps", lambda G: {AGENT1: 10**9})
+    own, others = gi.split_keyframes(build_dsg(), store)
+    assert AGENT1 not in own and sorted(f.timestamp_ns for f in others) == [150, 160, 200]
+
+
+def test_without_stamps_own_keyframe_is_the_identity_anchored_one(store):
+    own, others = gi.split_keyframes(build_dsg(), store)
+    assert {a: f.timestamp_ns for a, f in own.items()} == {AGENT0: 100, AGENT1: 200}
+    assert sorted(f.timestamp_ns for f in others) == [150, 160]
+
+
+def test_store_with_sub_keyframes_must_be_converted(tmp_path):
+    import sqlite3
+
+    d = build_store(tmp_path)
+    with sqlite3.connect(d / "store.sqlite") as c:
+        c.execute("UPDATE frames SET kind = 1 WHERE timestamp_ns = 150")
+    with pytest.raises(gi.ImageStoreError, match="hydra-image-store-adt4 convert"):
+        gi.open_image_store(str(d))
