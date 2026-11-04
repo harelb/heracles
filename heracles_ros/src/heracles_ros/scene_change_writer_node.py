@@ -16,7 +16,7 @@ from heracles.query_interface import Neo4jWrapper
 from heracles_ros_interfaces.msg import SceneChange, SceneChangeMsg
 from rclpy.node import Node
 
-from heracles_ros.map_state import bump_map_version
+from heracles_ros.map_state import notify_map_change
 from heracles_ros.scene_change import KIND_NAMES, apply_changes
 
 
@@ -94,7 +94,10 @@ class SceneChangeWriter(Node):
                 "object, held by a robot, or below min_confidence)"
             )
             return
-        version = bump_map_version(self.db)
+        # both counters: the publisher's _MapState and the console's _State
+        _, version = notify_map_change(
+            self.db, ["objects"], [a["symbol"] for a in applied]
+        )
         self.applied_pub.publish(
             applied_msg(msg.source, version, applied, self.get_clock().now().to_msg())
         )

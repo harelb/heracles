@@ -147,3 +147,24 @@ def test_a_held_object_is_not_removed():
     fake = _FakeDb({"O16": ("trash", (1.0, 2.0, 0.0))}, held={"O16"})
     assert remove_object(fake, "O16") is None
     assert "O16" in fake.objects
+
+
+def test_an_added_object_is_admitted_and_bumps_both_counters(db):
+    """Readers only see admitted objects, and the console watches _State."""
+    from heracles.graph_interface import notify_map_change
+    from heracles.read_queries import compile_admitted_query
+
+    applied = apply_changes(db, [(ADDED, "", "cone", (1.0, 2.0, 0.0))])
+    sym = applied[0]["symbol"]
+    row = db.query(
+        f"MATCH (o:Object {{nodeSymbol: '{sym}'}}) RETURN o.admission_status AS s"
+    )
+    assert row[0]["s"] == "admitted"
+    cypher, params, _ = compile_admitted_query(
+        {"classes": ["cone"], "select": ["nodeSymbol"]}
+    )
+    records, _, _ = db.execute(cypher, **params)
+    assert sym in [r["nodeSymbol"] for r in records]
+    state, version = notify_map_change(db, ["objects"], [sym])
+    assert version == get_map_version(db)
+

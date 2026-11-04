@@ -21,9 +21,13 @@ from __future__ import annotations
 import time
 from typing import List, Optional
 
+from heracles import constants
+
 ADDED, REMOVED, MOVED = 0, 1, 2
 KIND_NAMES = {ADDED: "ADDED", REMOVED: "REMOVED", MOVED: "MOVED"}
 NEW_OBJECT_SIZE = (0.5, 0.5, 0.5)
+# admission_policy_version of objects the scene change writer adds
+SCENE_CHANGE_POLICY_VERSION = "scene_change_v1"
 
 
 def object_center(db, symbol) -> Optional[tuple]:
@@ -134,7 +138,9 @@ def add_object(db, symbol, label, xyz) -> Optional[dict]:
             pos_x: $x, pos_y: $y, pos_z: $z,
             color_r: 0, color_g: 0, color_b: 0,
             is_active: true, is_predicted: false, registered: false,
-            first_observed_ns: [$now], last_observed_ns: [$now]
+            first_observed_ns: [$now], last_observed_ns: [$now],
+            admission_status: $admitted, admission_policy_version: $policy,
+            admission_reason: 'observed scene change'
         })
         """,
         **{
@@ -147,6 +153,10 @@ def add_object(db, symbol, label, xyz) -> Optional[dict]:
             "sy": sy,
             "sz": sz,
             "now": now,
+            # Readers (scene queries, the console) only see admitted objects; an
+            # observed change the writer accepted is admitted by that decision.
+            "admitted": constants.ADMITTED,
+            "policy": SCENE_CHANGE_POLICY_VERSION,
         },
     )
     _relink_to_nearest_place(db, symbol)
