@@ -35,6 +35,7 @@ DSG_PATH = os.path.expanduser(
     )
 )
 ROBOT = "hilbert"
+ANNOUNCED = []  # scene changes the state updater published
 
 
 def _connect():
@@ -69,6 +70,9 @@ def _holding_call(db, is_holding, object_id, position=None, robot_pose=None):
         ),
         _get_robot_pose=lambda name: robot_pose,
         get_logger=lambda: NS(info=lambda *_: None, error=lambda *_: None),
+        applied_pub=NS(publish=ANNOUNCED.append),
+        get_clock=lambda: NS(now=lambda: NS(to_msg=lambda: __import__(
+            "builtin_interfaces.msg", fromlist=["Time"]).Time())),
     )
     # the callback delegates to _update_holding_state (it catches Neo4j errors)
     updater._update_holding_state = lambda *args: HeraclesStateUpdater._update_holding_state(
@@ -114,7 +118,12 @@ def test_pick_and_place_at_the_given_point(db):
     assert get_map_version(db) == v0 + 1
 
     put_at = (12.5, -3.25, 0.4)
+    ANNOUNCED.clear()
     assert _holding_call(db, False, "O4", position=put_at)
+    # Announced as the robot's own change, so a planner does not replan on it.
+    (msg,) = ANNOUNCED
+    assert msg.source == f"executor/{ROBOT}" and msg.map_version == v0 + 2
+    assert msg.changes[0].symbol == "O4" and msg.changes[0].new_position.x == 12.5
     assert get_holding(db) == {}
     assert get_map_version(db) == v0 + 2
     np.testing.assert_allclose(_object_position(db, "O4"), put_at)

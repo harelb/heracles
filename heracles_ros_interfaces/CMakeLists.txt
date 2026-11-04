@@ -16,6 +16,8 @@ endif()
 
 rosidl_generate_interfaces(
   ${PROJECT_NAME}
+  msg/SceneChange.msg
+  msg/SceneChangeMsg.msg
   srv/UpdateHoldingState.srv
   DEPENDENCIES
   builtin_interfaces

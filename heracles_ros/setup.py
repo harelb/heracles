@@ -48,6 +48,7 @@ setup(
         "console_scripts": [
             "heracles_publisher_node = heracles_ros.heracles_publisher_node:main",
             "heracles_state_updater_node = heracles_ros.heracles_state_updater_node:main",
+            "scene_change_writer_node = heracles_ros.scene_change_writer_node:main",
         ],
     },
 )

@@ -104,6 +104,7 @@ class HeraclesPublisher(Node):
         self._publish_period_s = self.get_parameter("publish_period_s").value
         self._published_version = None
         self._last_publish = None
+        self._bad_version = None
         self.timer = self.create_timer(
             self.get_parameter("version_poll_period_s").value, self.poll_db
         )
@@ -141,7 +142,19 @@ class HeraclesPublisher(Node):
             or (now - self._last_publish).nanoseconds * 1e-9 >= self._publish_period_s
         )
         if version != self._published_version or stale:
-            self.publish_dsg()
+            try:
+                self.publish_dsg()
+            except Exception as exc:
+                # A node the scene graph cannot be built from (e.g. one written
+                # by hand without its attributes) must not stop the map for
+                # everyone: keep the last good map and say why, once a version.
+                self._last_publish = now
+                if version != self._bad_version:
+                    self._bad_version = version
+                    self.get_logger().error(
+                        f"Cannot publish map_version={version}; planners keep "
+                        f"map_version={self._published_version}: {exc}"
+                    )
 
     def publish_dsg(self):
         # Read the metadata before the graph: a write landing in between makes

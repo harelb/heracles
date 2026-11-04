@@ -12,6 +12,9 @@ from heracles_ros_interfaces.srv import UpdateHoldingState
 from rclpy.node import Node
 
 from heracles_ros.map_state import notify_map_change
+from heracles_ros.scene_change import MOVED, object_center
+from heracles_ros.scene_change_writer_node import applied_msg
+from heracles_ros_interfaces.msg import SceneChangeMsg
 
 
 class HeraclesStateUpdater(Node):
@@ -52,6 +55,12 @@ class HeraclesStateUpdater(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.timer = self.create_timer(1.0 / self.publish_rate, self.timer_callback)
+
+        # Placements, announced like any other scene change so a planner can
+        # tell them from changes it did not cause.
+        self.applied_pub = self.create_publisher(
+            SceneChangeMsg, "~/scene_changes_applied", 10
+        )
 
         # Each executor calls this in its own namespace.
         self.holding_srvs = [
@@ -139,6 +148,7 @@ class HeraclesStateUpdater(Node):
                 if put_at is None:
                     response.success = False
                 else:
+                    was_at = object_center(db, object_id)
                     # Release first. While HOLDS exists, the holding rule in
                     # dsg_updater keeps snapping the object back onto the
                     # robot, and could undo a position written before it.
@@ -147,7 +157,17 @@ class HeraclesStateUpdater(Node):
                     response.success = last_pos_success and unhold_success
             if response.success:
                 # both counters: the publisher's _MapState and the console's _State
-                notify_map_change(db, ["objects"], [object_id])
+                _, version = notify_map_change(db, ["objects"], [object_id])
+                if not is_holding:
+                    self.applied_pub.publish(
+                        applied_msg(
+                            f"executor/{robot_name}",
+                            version,
+                            [{"kind": MOVED, "symbol": object_id, "old": was_at,
+                              "new": tuple(put_at)}],
+                            self.get_clock().now().to_msg(),
+                        )
+                    )
 
     def timer_callback(self):
         for name in self.robot_names:
