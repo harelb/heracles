@@ -296,6 +296,18 @@ def _first_label(labels) -> str | None:
             return lab
     return next((lab for lab in labels if _IDENT.match(lab)), None)
 
+def _node_pos(props: dict):
+    """[x, y, z] of a node from its properties (center, else pos_x/y/z), or None:
+    the position a delete / retire reports, so readers know where it was."""
+    c = props.get("center")
+    if c is not None and _is_point(c):
+        v = plain(c)
+        return [float(v[0]), float(v[1]), float(v[2]) if len(v) > 2 else 0.0]
+    if props.get("pos_x") is not None and props.get("pos_y") is not None:
+        return [float(props["pos_x"]), float(props["pos_y"]), float(props.get("pos_z") or 0.0)]
+    return None
+
+
 
 class _Applier:
     """Applies ops through ``tx.run`` and collects changes, inverses, dirty layers."""
@@ -613,7 +625,8 @@ class _Applier:
         )  # fmt: skip
         self.inverse.append({"op": "restore_node", "symbol": sym})
         self.changes.append({"kind": "retire", "symbol": sym, "layer": label,
-                             "class": n["props"].get("class"), "name": n["props"].get("name")})  # fmt: skip
+                             "class": n["props"].get("class"), "name": n["props"].get("name"),
+                             "pos": _node_pos(n["props"])})  # fmt: skip
         self.touch(label, sym)
 
     def op_restore_node(self, op):
@@ -662,6 +675,7 @@ class _Applier:
         })  # fmt: skip
         self.changes.append({"kind": "delete", "symbol": sym, "layer": label,
                              "class": props.get("class"), "name": props.get("name"),
+                             "pos": _node_pos(props),
                              "edges": len(edges)})  # fmt: skip
         self.touch(label, sym)
 

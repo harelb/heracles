@@ -199,8 +199,10 @@ def test_create_update_retire_undo(shared):
     assert p["class"] == "tree" and list(p["bbox_center"])[:2] == pytest.approx([FAR + 2, FAR + 1])
     assert p["pos_x"] == pytest.approx(FAR + 2)
 
-    # retire: gone from the layer, restorable
-    ge.apply_edit(db, [{"op": "retire_node", "symbol": sym}], provenance=PROV)
+    # retire: gone from the layer, restorable; the change says where it was
+    ret = ge.apply_edit(db, [{"op": "retire_node", "symbol": sym}], provenance=PROV)
+    (rc,) = [c for c in ret["changes"] if c["kind"] == "retire"]
+    assert rc["pos"][:2] == pytest.approx([FAR + 2, FAR + 1])
     assert not q("MATCH (n:Object {nodeSymbol: $s}) RETURN n", s=sym)
     assert q("MATCH (n:Retired {nodeSymbol: $s}) RETURN n.retired_label AS l", s=sym)[0]["l"] == "Object"
     u = ge.undo_edit(db, provenance=PROV)
@@ -254,6 +256,7 @@ def test_edges_hard_delete_and_recreate(shared):
     assert again["changes"] == [] and again["mutation_id"] is None  # already connected
     d = ge.apply_edit(db, [{"op": "delete_node", "symbol": a}], provenance=PROV)
     assert d["changes"][0]["edges"] == 1
+    assert d["changes"][0]["pos"][:2] == pytest.approx([FAR, FAR])  # where it was
     assert not q("MATCH (n {nodeSymbol: $s}) RETURN n", s=a)
     ge.undo_edit(db, d["mutation_id"], provenance=PROV)
     assert q("MATCH (x:Object {nodeSymbol: $a})-[:OBJECT_CONNECTED]-(y {nodeSymbol: $b}) "
