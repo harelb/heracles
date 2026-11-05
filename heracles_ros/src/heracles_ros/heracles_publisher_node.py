@@ -17,6 +17,7 @@ from heracles_ros.hydra_python_publisher import DsgPublisher
 from heracles_ros.map_state import (
     METADATA_KEY,
     get_map_version,
+    is_rebuilding,
     map_metadata,
     seed_db,
 )
@@ -132,6 +133,10 @@ class HeraclesPublisher(Node):
             )
 
     def _poll_db(self):
+        # Mid-rebuild the map is partly deleted: planners would see places
+        # vanish and stop their robots. Keep the last map until it is done.
+        if is_rebuilding(self.db):
+            return
         version = get_map_version(self.db)
         now = self.get_clock().now()
         stale = (

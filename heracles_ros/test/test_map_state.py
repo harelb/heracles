@@ -55,7 +55,9 @@ def db():
     probe.close()
     seed_db(URI, AUTH, DSG_PATH)
     db = _connect()
-    db.query(f"MERGE (r:Robot {{name: '{ROBOT}'}}) SET r.position = point({{x: 1.0, y: 2.0, z: 0.5}})")
+    db.query(
+        f"MERGE (r:Robot {{name: '{ROBOT}'}}) SET r.position = point({{x: 1.0, y: 2.0, z: 0.5}})"
+    )
     yield db
     db.close()
 
@@ -71,8 +73,16 @@ def _holding_call(db, is_holding, object_id, position=None, robot_pose=None):
         _get_robot_pose=lambda name: robot_pose,
         get_logger=lambda: NS(info=lambda *_: None, error=lambda *_: None),
         applied_pub=NS(publish=ANNOUNCED.append),
-        get_clock=lambda: NS(now=lambda: NS(to_msg=lambda: __import__(
-            "builtin_interfaces.msg", fromlist=["Time"]).Time())),
+        get_clock=lambda: NS(
+            now=lambda: NS(
+                to_msg=lambda: __import__(
+                    "builtin_interfaces.msg", fromlist=["Time"]
+                ).Time()
+            )
+        ),
+    )
+    updater._update_holding_state = (
+        lambda *a: HeraclesStateUpdater._update_holding_state(updater, *a)
     )
     req = UpdateHoldingState.Request()
     req.is_holding, req.id = is_holding, object_id
@@ -86,14 +96,18 @@ def _holding_call(db, is_holding, object_id, position=None, robot_pose=None):
 
 def _object_position(db, symbol):
     G = db_to_spark_dsg(db)
-    return np.array(G.get_node(spark_dsg.NodeSymbol(symbol[0], int(symbol[1:]))).attributes.position)
+    return np.array(
+        G.get_node(spark_dsg.NodeSymbol(symbol[0], int(symbol[1:]))).attributes.position
+    )
 
 
 def test_seed_matches_the_file(db):
     original = spark_dsg.DynamicSceneGraph.load(DSG_PATH)
     loaded = db_to_spark_dsg(db)
     for layer in (spark_dsg.DsgLayers.OBJECTS, spark_dsg.DsgLayers.MESH_PLACES):
-        assert original.get_layer(layer).num_nodes() == loaded.get_layer(layer).num_nodes()
+        assert (
+            original.get_layer(layer).num_nodes() == loaded.get_layer(layer).num_nodes()
+        )
     # A fresh map is version 1, never 0 ("no map yet"), and holds nothing.
     assert get_map_version(db) == 1
     assert get_holding(db) == {}

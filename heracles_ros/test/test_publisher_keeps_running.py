@@ -31,6 +31,7 @@ def _node(errors):
 
 def test_an_unbuildable_map_is_reported_once_and_does_not_raise(monkeypatch):
     monkeypatch.setattr(hp, "get_map_version", lambda db: 4)
+    monkeypatch.setattr(hp, "is_rebuilding", lambda db: False)
     errors = []
     node = _node(errors)
     hp.HeraclesPublisher._poll_db(node)
