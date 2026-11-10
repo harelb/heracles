@@ -92,7 +92,9 @@ def seed_db(uri: str, auth: tuple, dsg_path: str) -> int:
     version counter, so it is only for the start of a run. The version is then
     bumped once, so a fresh map is never confused with "no map yet" (0).
     """
-    load_dsg_to_db(uri, auth, spark_dsg.DynamicSceneGraph.load(dsg_path))
+    load_dsg_to_db(
+        uri, auth, spark_dsg.DynamicSceneGraph.load(dsg_path), source_file_path=dsg_path
+    )
     with Neo4jWrapper(uri, auth, atomic_queries=True, print_profiles=False) as db:
         # The original the change log rebuilds from: only a map that was seeded
         # from a file can be rebuilt from it.
@@ -104,6 +106,15 @@ def seed_db(uri: str, auth: tuple, dsg_path: str) -> int:
 
 
 def get_prior_path(db) -> str:
-    """The scene graph file the map was seeded from ("" if it was not)."""
+    """The scene graph file the map was seeded from ("" if it was not).
+
+    seed_db records it in _MapState. A map loaded from a file some other way
+    (load_dsg_to_db with source_file_path, a console reload) records only the
+    _GraphMetadata source, so fall back to that.
+    """
     rows = db.query(f"MATCH (m:{_MAP_STATE}) RETURN m.prior_path AS p")
+    path = (rows[0]["p"] or "") if rows else ""
+    if path:
+        return path
+    rows = db.query("MATCH (m:_GraphMetadata {key: 'source'}) RETURN m.file_path AS p")
     return (rows[0]["p"] or "") if rows else ""
