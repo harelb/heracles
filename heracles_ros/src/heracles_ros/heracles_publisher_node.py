@@ -17,6 +17,7 @@ from heracles_ros.hydra_python_publisher import DsgPublisher
 from heracles_ros.map_state import (
     METADATA_KEY,
     get_map_version,
+    is_rebuilding,
     map_metadata,
     seed_db,
 )
@@ -101,6 +102,7 @@ class HeraclesPublisher(Node):
         self._publish_period_s = self.get_parameter("publish_period_s").value
         self._published_version = None
         self._last_publish = None
+        self._bad_version = None
         self.timer = self.create_timer(
             self.get_parameter("version_poll_period_s").value, self.poll_db
         )
@@ -131,6 +133,10 @@ class HeraclesPublisher(Node):
             )
 
     def _poll_db(self):
+        # Mid-rebuild the map is partly deleted: planners would see places
+        # vanish and stop their robots. Keep the last map until it is done.
+        if is_rebuilding(self.db):
+            return
         version = get_map_version(self.db)
         now = self.get_clock().now()
         stale = (
@@ -138,7 +144,19 @@ class HeraclesPublisher(Node):
             or (now - self._last_publish).nanoseconds * 1e-9 >= self._publish_period_s
         )
         if version != self._published_version or stale:
-            self.publish_dsg()
+            try:
+                self.publish_dsg()
+            except Exception as exc:
+                # A node the scene graph cannot be built from (e.g. one written
+                # by hand without its attributes) must not stop the map for
+                # everyone: keep the last good map and say why, once a version.
+                self._last_publish = now
+                if version != self._bad_version:
+                    self._bad_version = version
+                    self.get_logger().error(
+                        f"Cannot publish map_version={version}; planners keep "
+                        f"map_version={self._published_version}: {exc}"
+                    )
 
     def publish_dsg(self):
         # Read the metadata before the graph: a write landing in between makes

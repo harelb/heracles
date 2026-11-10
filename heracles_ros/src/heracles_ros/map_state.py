@@ -13,10 +13,16 @@ the published graph. Two things do:
 
 Both are written into the graph's metadata under ``METADATA_KEY``. Robot pose
 updates do not bump the version: they are not changes to the map.
+
+While the change log rebuilds the map (change_log.rebuild), the map nodes are
+briefly gone or half written. ``rebuilding`` marks that time, so the publisher
+holds the last map instead of publishing a partial one, and editors wait.
 """
 
 from __future__ import annotations
 
+import os
+import time
 from typing import Dict, List
 
 import spark_dsg
@@ -39,6 +45,24 @@ def bump_map_version(db) -> int:
         "RETURN m.version AS v"
     )
     return int(rows[0]["v"])
+
+
+# A rebuild marked longer ago than this is taken as abandoned (its writer died
+# mid-rebuild): the map is published again rather than held for ever.
+REBUILD_STALE_S = 120.0
+
+
+def set_rebuilding(db, rebuilding: bool) -> None:
+    db.execute(
+        f"MERGE (m:{_MAP_STATE}) SET m.rebuilding_since = $t",
+        t=time.time() if rebuilding else None,
+    )
+
+
+def is_rebuilding(db) -> bool:
+    rows = db.query(f"MATCH (m:{_MAP_STATE}) RETURN m.rebuilding_since AS t")
+    since = rows[0]["t"] if rows else None
+    return since is not None and time.time() - float(since) < REBUILD_STALE_S
 
 
 def get_holding(db) -> Dict[str, List[str]]:
@@ -70,4 +94,16 @@ def seed_db(uri: str, auth: tuple, dsg_path: str) -> int:
     """
     load_dsg_to_db(uri, auth, spark_dsg.DynamicSceneGraph.load(dsg_path))
     with Neo4jWrapper(uri, auth, atomic_queries=True, print_profiles=False) as db:
+        # The original the change log rebuilds from: only a map that was seeded
+        # from a file can be rebuilt from it.
+        db.execute(
+            f"MERGE (m:{_MAP_STATE}) SET m.prior_path = $p",
+            p=os.path.abspath(dsg_path),
+        )
         return bump_map_version(db)
+
+
+def get_prior_path(db) -> str:
+    """The scene graph file the map was seeded from ("" if it was not)."""
+    rows = db.query(f"MATCH (m:{_MAP_STATE}) RETURN m.prior_path AS p")
+    return (rows[0]["p"] or "") if rows else ""

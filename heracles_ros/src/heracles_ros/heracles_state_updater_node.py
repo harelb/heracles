@@ -8,10 +8,14 @@ from dsg_updater.dsg_state_utils import robot_hold_obj, robot_unhold_obj, set_ob
 from geometry_msgs.msg import TransformStamped
 from heracles.query_interface import Neo4jWrapper
 from heracles_agents.dsg_interfaces import HeraclesDsgInterface
+from heracles_ros_interfaces.msg import SceneChangeMsg
 from heracles_ros_interfaces.srv import UpdateHoldingState
 from rclpy.node import Node
 
+from heracles_ros.change_log import record
 from heracles_ros.map_state import bump_map_version
+from heracles_ros.scene_change import MOVED, object_center
+from heracles_ros.scene_change_writer_node import applied_msg
 
 
 class HeraclesStateUpdater(Node):
@@ -52,6 +56,12 @@ class HeraclesStateUpdater(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.timer = self.create_timer(1.0 / self.publish_rate, self.timer_callback)
+
+        # Placements, announced like any other scene change so a planner can
+        # tell them from changes it did not cause.
+        self.applied_pub = self.create_publisher(
+            SceneChangeMsg, "~/scene_changes_applied", 10
+        )
 
         # Each executor calls this in its own namespace.
         self.holding_srvs = [
@@ -139,6 +149,7 @@ class HeraclesStateUpdater(Node):
                 if put_at is None:
                     response.success = False
                 else:
+                    was_at = object_center(db, object_id)
                     # Release first. While HOLDS exists, the holding rule in
                     # dsg_updater keeps snapping the object back onto the
                     # robot, and could undo a position written before it.
@@ -146,7 +157,32 @@ class HeraclesStateUpdater(Node):
                     last_pos_success = set_obj_center(db, object_id, *put_at)
                     response.success = last_pos_success and unhold_success
             if response.success:
-                bump_map_version(db)
+                if not is_holding:
+                    # Logged, so a rebuild of the map keeps the object where
+                    # the robot put it.
+                    record(
+                        db,
+                        f"executor/{robot_name}",
+                        "move_object",
+                        {"symbol": object_id, "xyz": [float(v) for v in put_at]},
+                    )
+                version = bump_map_version(db)
+                if not is_holding:
+                    self.applied_pub.publish(
+                        applied_msg(
+                            f"executor/{robot_name}",
+                            version,
+                            [
+                                {
+                                    "kind": MOVED,
+                                    "symbol": object_id,
+                                    "old": was_at,
+                                    "new": tuple(put_at),
+                                }
+                            ],
+                            self.get_clock().now().to_msg(),
+                        )
+                    )
 
     def timer_callback(self):
         for name in self.robot_names:

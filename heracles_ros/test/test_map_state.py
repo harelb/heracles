@@ -35,6 +35,7 @@ DSG_PATH = os.path.expanduser(
     )
 )
 ROBOT = "hilbert"
+ANNOUNCED = []  # scene changes the state updater published
 
 
 def _connect():
@@ -54,7 +55,9 @@ def db():
     probe.close()
     seed_db(URI, AUTH, DSG_PATH)
     db = _connect()
-    db.query(f"MERGE (r:Robot {{name: '{ROBOT}'}}) SET r.position = point({{x: 1.0, y: 2.0, z: 0.5}})")
+    db.query(
+        f"MERGE (r:Robot {{name: '{ROBOT}'}}) SET r.position = point({{x: 1.0, y: 2.0, z: 0.5}})"
+    )
     yield db
     db.close()
 
@@ -69,6 +72,17 @@ def _holding_call(db, is_holding, object_id, position=None, robot_pose=None):
         ),
         _get_robot_pose=lambda name: robot_pose,
         get_logger=lambda: NS(info=lambda *_: None, error=lambda *_: None),
+        applied_pub=NS(publish=ANNOUNCED.append),
+        get_clock=lambda: NS(
+            now=lambda: NS(
+                to_msg=lambda: __import__(
+                    "builtin_interfaces.msg", fromlist=["Time"]
+                ).Time()
+            )
+        ),
+    )
+    updater._update_holding_state = (
+        lambda *a: HeraclesStateUpdater._update_holding_state(updater, *a)
     )
     req = UpdateHoldingState.Request()
     req.is_holding, req.id = is_holding, object_id
@@ -82,14 +96,18 @@ def _holding_call(db, is_holding, object_id, position=None, robot_pose=None):
 
 def _object_position(db, symbol):
     G = db_to_spark_dsg(db)
-    return np.array(G.get_node(spark_dsg.NodeSymbol(symbol[0], int(symbol[1:]))).attributes.position)
+    return np.array(
+        G.get_node(spark_dsg.NodeSymbol(symbol[0], int(symbol[1:]))).attributes.position
+    )
 
 
 def test_seed_matches_the_file(db):
     original = spark_dsg.DynamicSceneGraph.load(DSG_PATH)
     loaded = db_to_spark_dsg(db)
     for layer in (spark_dsg.DsgLayers.OBJECTS, spark_dsg.DsgLayers.MESH_PLACES):
-        assert original.get_layer(layer).num_nodes() == loaded.get_layer(layer).num_nodes()
+        assert (
+            original.get_layer(layer).num_nodes() == loaded.get_layer(layer).num_nodes()
+        )
     # A fresh map is version 1, never 0 ("no map yet"), and holds nothing.
     assert get_map_version(db) == 1
     assert get_holding(db) == {}
@@ -110,7 +128,12 @@ def test_pick_and_place_at_the_given_point(db):
     assert get_map_version(db) == v0 + 1
 
     put_at = (12.5, -3.25, 0.4)
+    ANNOUNCED.clear()
     assert _holding_call(db, False, "O4", position=put_at)
+    # Announced as the robot's own change, so a planner does not replan on it.
+    (msg,) = ANNOUNCED
+    assert msg.source == f"executor/{ROBOT}" and msg.map_version == v0 + 2
+    assert msg.changes[0].symbol == "O4" and msg.changes[0].new_position.x == 12.5
     assert get_holding(db) == {}
     assert get_map_version(db) == v0 + 2
     np.testing.assert_allclose(_object_position(db, "O4"), put_at)
