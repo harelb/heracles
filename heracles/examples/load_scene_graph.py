@@ -40,7 +40,13 @@ if __name__ == "__main__":
     print("Done loading the scene graph from file.")
     summarize_dsg(scene_graph)
 
-    load_dsg_to_db(args.neo4j_uri, neo4j_creds, scene_graph, image_store=args.image_store or None)
+    load_dsg_to_db(
+        args.neo4j_uri,
+        neo4j_creds,
+        scene_graph,
+        image_store=args.image_store or None,
+        source_file_path=args.scene_graph,
+    )
 
     db = Neo4jWrapper(
         args.neo4j_uri, neo4j_creds, atomic_queries=True, print_profiles=False

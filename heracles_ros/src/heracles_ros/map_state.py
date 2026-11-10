@@ -114,7 +114,13 @@ def seed_db(uri: str, auth: tuple, dsg_path: str, image_store="auto") -> int:
     """
     if image_store == "auto":
         image_store = find_run_image_store(dsg_path)
-    load_dsg_to_db(uri, auth, spark_dsg.DynamicSceneGraph.load(dsg_path), image_store=image_store)
+    load_dsg_to_db(
+        uri,
+        auth,
+        spark_dsg.DynamicSceneGraph.load(dsg_path),
+        image_store=image_store,
+        source_file_path=dsg_path,
+    )
     with Neo4jWrapper(uri, auth, atomic_queries=True, print_profiles=False) as db:
         # the graph is stored without its mesh: record the run's mesh file so viewers
         # (e.g. the web console's Neo4j source) can draw it
@@ -137,6 +143,15 @@ def find_run_mesh(dsg_path: str) -> Optional[str]:
 
 
 def get_prior_path(db) -> str:
-    """The scene graph file the map was seeded from ("" if it was not)."""
+    """The scene graph file the map was seeded from ("" if it was not).
+
+    seed_db records it in _MapState. A map loaded from a file some other way
+    (load_dsg_to_db with source_file_path, a console reload) records only the
+    _GraphMetadata source, so fall back to that.
+    """
     rows = db.query(f"MATCH (m:{_MAP_STATE}) RETURN m.prior_path AS p")
+    path = (rows[0]["p"] or "") if rows else ""
+    if path:
+        return path
+    rows = db.query("MATCH (m:_GraphMetadata {key: 'source'}) RETURN m.file_path AS p")
     return (rows[0]["p"] or "") if rows else ""

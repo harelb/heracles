@@ -44,7 +44,7 @@ def extract_labelspaces_from_dsg(G):
     return object_ls, room_ls
 
 
-def load_dsg_to_db(neo4j_uri, neo4j_creds, scene_graph, image_store=None):
+def load_dsg_to_db(neo4j_uri, neo4j_creds, scene_graph, image_store=None, source_file_path=None):
     """Load a DSG into Neo4j.
 
     Labelspaces must be embedded in the DSG metadata via ``set_labelspace()``.
@@ -60,6 +60,9 @@ def load_dsg_to_db(neo4j_uri, neo4j_creds, scene_graph, image_store=None):
         Observation, SubKeyframe and CameraCalib nodes are created from it and
         Agent nodes get their keyframe image paths. A legacy run directory
         raises a clear error pointing at ``hydra-image-store-adt4 import-legacy``.
+    source_file_path : str or None
+        Pass it when the DSG was loaded from a file: it is recorded so that the
+        map can later be rebuilt from that file (undo, reset).
     """
     # Set the layer id to layer name mappings
     spark_layer_id_to_heracles_layer_str = {
@@ -82,4 +85,6 @@ def load_dsg_to_db(neo4j_uri, neo4j_creds, scene_graph, image_store=None):
         initialize_db(db)
         # Load the scene graph into the DB
         print("Loading the scene graph into the database.")
-        spark_dsg_to_db(scene_graph, db, image_store=image_store)
+        spark_dsg_to_db(
+            scene_graph, db, source_file_path=source_file_path, image_store=image_store
+        )
