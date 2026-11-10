@@ -436,7 +436,74 @@ def add_agents_from_dsg(G, db):
     agents = [agent_to_dict(a) for a in _agent_nodes(G)]
     if agents:
         insert_agents_to_db(db, agents)
+        insert_agent_edges_to_db(db, *agent_edges(G))
     return len(agents)
+
+
+_AGENT_PLACE_LAYERS = {3: constants.PLACES, 20: constants.MESH_PLACES}
+
+
+def _place_label(G, node_id):
+    """Heracles label of a place-layer node (places or mesh places), else None."""
+    node = G.get_node(node_id)
+    label = _AGENT_PLACE_LAYERS.get(node.layer.layer)
+    if label is None and node.layer.layer == 3 and node.layer.partition != 0:
+        label = constants.MESH_PLACES  # mesh places as a partition of layer 3
+    return label
+
+
+def agent_edges(G):
+    """The agent edges of ``G``: ``(trajectory, place_agent)``.
+
+    ``trajectory`` holds one ``{"from", "to"}`` row per edge between two agent
+    nodes (the robot path), ``place_agent`` one row per edge between a place or
+    mesh place and an agent, from the place.
+    """
+    agent_ids = {a.id.value for a in _agent_nodes(G)}
+    trajectory, place_agent = [], []
+    for a in _agent_nodes(G):
+        sym = a.id.str(True)
+        for sid in a.siblings():
+            if sid in agent_ids and a.id.value < sid:
+                to_ns = spark_dsg.NodeSymbol(sid).str(True)
+                trajectory.append({"from": sym, "to": to_ns})
+        for nid in list(a.parents()) + list(a.children()):
+            label = _place_label(G, nid)
+            if label is not None:
+                from_ns = spark_dsg.NodeSymbol(nid).str(True)
+                place_agent.append({"from": from_ns, "to": sym, "label": label})
+    return trajectory, place_agent
+
+
+def insert_agent_edges_to_db(db, trajectory, place_agent):
+    """MERGE ``(:Agent)-[:AGENT_CONNECTED]->(:Agent)`` and
+    ``(:Place|:MeshPlace)-[:CONTAINS]->(:Agent)``, so re-ingesting adds no
+    duplicates. Edges to nodes that are not in the database are skipped."""
+    if trajectory:
+        db.execute(
+            f"""
+        WITH $edges AS edges
+        UNWIND edges AS e
+        MATCH (a:{constants.AGENTS} {{nodeSymbol: e.from}})
+        MATCH (b:{constants.AGENTS} {{nodeSymbol: e.to}})
+        MERGE (a)-[:AGENT_CONNECTED]->(b)
+        """,
+            edges=trajectory,
+        )
+    for label in (constants.PLACES, constants.MESH_PLACES):
+        rows = [e for e in place_agent if e["label"] == label]
+        if not rows:
+            continue
+        db.execute(
+            f"""
+        WITH $edges AS edges
+        UNWIND edges AS e
+        MATCH (p:{label} {{nodeSymbol: e.from}})
+        MATCH (a:{constants.AGENTS} {{nodeSymbol: e.to}})
+        MERGE (p)-[:CONTAINS]->(a)
+        """,
+            edges=rows,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +533,8 @@ def spark_dsg_to_db(G, db, source_file_path=None):
     add_rooms_from_dsg(G, db, room_labelspace=room_ls)
     add_buildings_from_dsg(G, db)
     add_edges_from_dsg(G, db)
+    # agents went in before the places: add their edges now that both exist
+    insert_agent_edges_to_db(db, *agent_edges(G))
 
     # Store labelspaces in Neo4j so db_to_spark_dsg() can reconstruct
     # without requiring external YAML files or function arguments.

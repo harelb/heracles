@@ -60,6 +60,8 @@ def build_dsg():
         a.world_R_body = spark_dsg.Quaternion(1.0, 0.0, 0.0, 0.0)
         a.timestamp = datetime.timedelta(microseconds=stamp_us)
         G.add_node(2, nid, a, ord("a"))
+    G.insert_edge(AGENT0, AGENT1)  # the robot path
+    G.insert_edge(place_id, AGENT1)  # the place the agent is in
 
     G.metadata.add({"LayerIdToHeraclesLayerStr": LAYER_NAMES})
     return G

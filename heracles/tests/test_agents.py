@@ -59,3 +59,25 @@ def test_add_agents_from_dsg_is_idempotent(db):
     assert gi.add_agents_from_dsg(G, db) == 2
     records, _, _ = db.execute(f"MATCH (a:{constants.AGENTS}) RETURN count(a) AS n")
     assert records[0]["n"] == 2
+
+
+def test_agent_edges():
+    trajectory, place_agent = gi.agent_edges(build_dsg())
+    assert trajectory == [{"from": "a0", "to": "a1"}]
+    assert place_agent == [{"from": "p0", "to": "a1", "label": constants.PLACES}]
+
+
+def test_spark_dsg_to_db_writes_agent_edges(db):
+    G = build_dsg()
+    gi.spark_dsg_to_db(G, db)
+    gi.add_agents_from_dsg(G, db)  # again: MERGE adds no duplicates
+    records, _, _ = db.execute(
+        f"MATCH (a:{constants.AGENTS})-[:AGENT_CONNECTED]->(b:{constants.AGENTS}) "
+        "RETURN a.nodeSymbol AS f, b.nodeSymbol AS t"
+    )
+    assert [(r["f"], r["t"]) for r in records] == [("a0", "a1")]
+    records, _, _ = db.execute(
+        f"MATCH (p:{constants.PLACES})-[:CONTAINS]->(a:{constants.AGENTS}) "
+        "RETURN p.nodeSymbol AS f, a.nodeSymbol AS t"
+    )
+    assert [(r["f"], r["t"]) for r in records] == [("p0", "a1")]
