@@ -18,7 +18,8 @@ Lossy properties
 Some attribute data is NOT round-tripped through Neo4j:
 - TravNodeAttributes boundary (radii, states) — deferred, store only position
 - Place2dNodeAttributes boundary (polygon points) — deferred
-- AgentNodeAttributes (world_R_body, dbow) — not stored
+- AgentNodeAttributes — stored as ``Agent`` rows (pose, stamp) that are not
+  read back by ``db_to_spark_dsg``; dbow vectors are not stored
 
 The source JSON file should be considered the authoritative copy.  Neo4j
 stores the subset needed for visualization and editing.
@@ -27,6 +28,7 @@ Edge handling remains layer-aware since edge types are determined by the
 layer relationship (intralayer vs interlayer), not by attribute types.
 """
 
+import datetime
 import logging
 
 import neo4j
@@ -87,6 +89,7 @@ def initialize_db(db):
     try_drop_index(db, "mesh_place_node_symbol")
     try_drop_index(db, "room_node_symbol")
     try_drop_index(db, "building_node_symbol")
+    try_drop_index(db, "agent_node_symbol")
 
     db.execute(
         f"CREATE INDEX object_node_symbol FOR (n:{constants.OBJECTS}) ON (n.nodeSymbol)"
@@ -102,6 +105,9 @@ def initialize_db(db):
     )
     db.execute(
         f"CREATE INDEX building_node_symbol FOR (n:{constants.BUILDINGS}) ON (n.nodeSymbol)"
+    )
+    db.execute(
+        f"CREATE INDEX agent_node_symbol FOR (n:{constants.AGENTS}) ON (n.nodeSymbol)"
     )
 
 
@@ -350,6 +356,90 @@ def add_buildings_from_dsg(G, db):
 
 
 # ---------------------------------------------------------------------------
+# Agents (robot keyframe poses)
+# ---------------------------------------------------------------------------
+
+
+def _agent_stamp_ns(attrs):
+    """Agent node stamp in ns, None when unset (the binding defaults it to 0)."""
+    ts = getattr(attrs, "timestamp", None)
+    if ts is None:
+        return None
+    ns = (ts // datetime.timedelta(microseconds=1)) * 1000
+    return ns if ns > 0 else None
+
+
+def _agent_nodes(G):
+    """Every agent node of ``G``.
+
+    Agents share layer id 2 with OBJECTS but live in non-zero partitions (one
+    per robot prefix), so ``G.get_layer(DsgLayers.AGENTS)`` (partition 0) would
+    return the objects. Enumerate the partitions instead.
+    """
+    agents_layer = spark_dsg.DsgLayers.name_to_layer_id("AGENTS").layer
+    for key in G.layer_keys:
+        if key.layer != agents_layer or key.partition == 0:
+            continue
+        for a in G.get_layer(key.layer, key.partition).nodes:
+            if isinstance(a.attributes, spark_dsg.AgentNodeAttributes):
+                yield a
+
+
+def agent_to_dict(agent):
+    """Flat ``Agent`` row: position, orientation (w, x, y, z) and stamp."""
+    attrs = agent.attributes
+    rot = attrs.world_R_body
+    d = {
+        "nodeSymbol": agent.id.str(True),
+        "pos_x": float(attrs.position[0]),
+        "pos_y": float(attrs.position[1]),
+        "pos_z": float(attrs.position[2]),
+        "rot_w": float(rot.w),
+        "rot_x": float(rot.x),
+        "rot_y": float(rot.y),
+        "rot_z": float(rot.z),
+    }
+    ts_ns = _agent_stamp_ns(attrs)
+    if ts_ns is not None:
+        d["timestamp_ns"] = ts_ns
+    return d
+
+
+def insert_agents_to_db(db, agents):
+    """MERGE ``Agent`` nodes. Image properties (``frame_id``, ``rgb_path``,
+    ``depth_path``) are only overwritten when the row has them."""
+    return db.execute(
+        f"""
+    WITH $agents AS agents
+    UNWIND agents AS agent
+    WITH point({{x: agent.pos_x, y: agent.pos_y, z: agent.pos_z}}) AS p3d, agent
+    MERGE (n:{constants.AGENTS} {{nodeSymbol: agent.nodeSymbol}})
+    SET n.center = p3d,
+        n.rot_w = agent.rot_w,
+        n.rot_x = agent.rot_x,
+        n.rot_y = agent.rot_y,
+        n.rot_z = agent.rot_z,
+        n.frame_id = coalesce(agent.frame_id, n.frame_id),
+        n.rgb_path = coalesce(agent.rgb_path, n.rgb_path),
+        n.depth_path = coalesce(agent.depth_path, n.depth_path),
+        n.timestamp_ns = coalesce(agent.timestamp_ns, n.timestamp_ns)
+    """,
+        agents=agents,
+    )
+
+
+def add_agents_from_dsg(G, db):
+    """Insert one ``Agent`` node per agent (keyframe) node of ``G``.
+
+    Returns the number of agents written.
+    """
+    agents = [agent_to_dict(a) for a in _agent_nodes(G)]
+    if agents:
+        insert_agents_to_db(db, agents)
+    return len(agents)
+
+
+# ---------------------------------------------------------------------------
 # Top-level load: spark_dsg → Neo4j
 # ---------------------------------------------------------------------------
 
@@ -369,6 +459,7 @@ def spark_dsg_to_db(G, db, source_file_path=None):
 
     object_ls, room_ls = extract_labelspaces_from_dsg(G)
 
+    add_agents_from_dsg(G, db)
     add_objects_from_dsg(G, db, object_labelspace=object_ls)
     add_places_from_dsg(G, db)
     add_mesh_places_from_dsg(G, db, object_labelspace=object_ls)
