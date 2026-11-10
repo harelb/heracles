@@ -408,6 +408,50 @@ def spark_dsg_to_db(G, db, source_file_path=None):
 
 
 # ---------------------------------------------------------------------------
+# Map version counters
+# ---------------------------------------------------------------------------
+
+# Polled by the heracles_ros publisher (heracles_ros.map_state), which
+# republishes the DSG when it changes.
+_MAP_STATE = "_MapState"
+
+
+def read_version(db) -> int:
+    """Return ``_State {key: 'global'}.version``, 0 before the first change.
+
+    Readers that cache a view of the database (e.g. a map viewer) compare this
+    counter to decide when to reload.
+    """
+    records, _, _ = db.execute("MATCH (s:_State {key: 'global'}) RETURN s.version AS v")
+    return int(records[0]["v"]) if records and records[0]["v"] is not None else 0
+
+
+def notify_map_change(db, dirty_layers=None, affected_ids=None) -> tuple:
+    """Record that the map changed by bumping both version counters at once.
+
+    * ``_State {key: 'global'}.version`` (see :func:`read_version`), with the
+      changed ``dirty_layers`` (``"layer:partition"`` strings) and
+      ``affected_ids`` (node symbols) so readers can refresh only those.
+    * ``_MapState.version``, which the heracles_ros publisher polls to
+      republish the scene graph.
+
+    Map writers call this after a write. Returns ``(state_version, map_version)``.
+    """
+    records, _, _ = db.execute(
+        "MERGE (s:_State {key: 'global'}) "
+        "ON CREATE SET s.version = 1 "
+        "ON MATCH SET s.version = s.version + 1 "
+        "SET s.dirty_layers = $dl, s.affected_ids = $ai "
+        f"WITH s MERGE (m:{_MAP_STATE}) "
+        "SET m.version = coalesce(m.version, 0) + 1 "
+        "RETURN s.version AS sv, m.version AS mv",
+        dl=list(dirty_layers or []),
+        ai=list(affected_ids or []),
+    )
+    return int(records[0]["sv"]), int(records[0]["mv"])
+
+
+# ---------------------------------------------------------------------------
 # Edge insertion (unchanged — layer-aware, not type-aware)
 # ---------------------------------------------------------------------------
 
