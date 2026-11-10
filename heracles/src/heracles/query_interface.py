@@ -42,7 +42,7 @@ class Neo4jWrapper:
             if self.print_profiles:
                 query = "PROFILE\n" + query
             records, summary, etc = self.driver.execute_query(
-                query, parameters=parameters, database_=self.db_name, **kwargs
+                query, parameters_=parameters, database_=self.db_name, **kwargs
             )
 
             if (
