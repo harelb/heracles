@@ -408,6 +408,38 @@ def spark_dsg_to_db(G, db, source_file_path=None):
 
 
 # ---------------------------------------------------------------------------
+# Mesh path (the mesh stays on disk; Neo4j stores where it is)
+# ---------------------------------------------------------------------------
+
+
+def store_mesh_path(db, mesh_path, mesh_format=None):
+    """Record the scene mesh file so viewers can load it directly.
+
+    Stored as ``file_path`` / ``format`` on ``_GraphMetadata {key: 'mesh'}``.
+    ``mesh_format`` defaults to the file extension (e.g. ``"ply"``).
+    """
+    import os
+
+    abs_path = os.path.abspath(str(mesh_path))
+    fmt = mesh_format or os.path.splitext(abs_path)[1].lstrip(".").lower() or "ply"
+    db.execute(
+        "MERGE (m:_GraphMetadata {key: 'mesh'}) SET m.file_path = $path, m.format = $fmt",
+        path=abs_path,
+        fmt=fmt,
+    )
+
+
+def read_mesh_path(db):
+    """Return ``(file_path, format)`` of the scene mesh, or ``(None, None)``."""
+    records, _, _ = db.execute(
+        "MATCH (m:_GraphMetadata {key: 'mesh'}) RETURN m.file_path AS p, m.format AS f"
+    )
+    if records:
+        return records[0]["p"], records[0]["f"]
+    return None, None
+
+
+# ---------------------------------------------------------------------------
 # Map version counters
 # ---------------------------------------------------------------------------
 
