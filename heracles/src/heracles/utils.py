@@ -45,7 +45,9 @@ def extract_labelspaces_from_dsg(G):
     return object_ls, room_ls
 
 
-def load_dsg_to_db(neo4j_uri, neo4j_creds, scene_graph, source_file_path=None):
+def load_dsg_to_db(
+    neo4j_uri, neo4j_creds, scene_graph, source_file_path=None, image_store=None
+):
     """Load a DSG into Neo4j.
 
     Labelspaces must be embedded in the DSG metadata via ``set_labelspace()``.
@@ -53,6 +55,8 @@ def load_dsg_to_db(neo4j_uri, neo4j_creds, scene_graph, source_file_path=None):
 
     Pass ``source_file_path`` when the DSG was loaded from a file: it is
     recorded so that the map can later be rebuilt from that file (undo, reset).
+    ``image_store`` optionally adds the run's images (see
+    ``graph_interface.spark_dsg_to_db``); it needs ``hydra_python``.
     """
     # Set the layer id to layer name mappings
     spark_layer_id_to_heracles_layer_str = {
@@ -79,7 +83,12 @@ def load_dsg_to_db(neo4j_uri, neo4j_creds, scene_graph, source_file_path=None):
             reload.wiped()
             # Load the scene graph into the DB
             print("Loading the scene graph into the database.")
-            spark_dsg_to_db(scene_graph, db, source_file_path=source_file_path)
+            spark_dsg_to_db(
+                scene_graph,
+                db,
+                source_file_path=source_file_path,
+                image_store=image_store,
+            )
             # _MapState survived the wipe: the file it names must be this one,
             # or a rebuild would start from the previous map.
             if source_file_path is not None:

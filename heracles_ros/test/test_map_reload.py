@@ -212,7 +212,7 @@ def test_load_dsg_to_db_holds_the_map_and_records_its_file(monkeypatch):
         d.wipe(keep_robots=True)
         d.state = None  # the mark must not depend on _MapState surviving
 
-    def spark_dsg_to_db(graph, d, source_file_path=None):
+    def spark_dsg_to_db(graph, d, source_file_path=None, image_store=None):
         assert is_rebuilding(d)  # re-marked right after the wipe
         d.objects = {"O1", "O2"}
         d.log.append("load")
