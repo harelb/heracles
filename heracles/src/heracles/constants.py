@@ -10,6 +10,15 @@ ROOMS = "Room"
 BUILDINGS = "Building"
 AGENTS = "Agent"
 
+# Image-store derived nodes and edges (see graph_interface.spark_dsg_to_db)
+OBSERVATIONS = "Observation"
+SUBKEYFRAMES = "SubKeyframe"
+CAMERA_CALIBS = "CameraCalib"
+HAS_OBSERVATION = "HAS_OBSERVATION"
+ANCHORED_TO = "ANCHORED_TO"
+HAS_CALIB = "HAS_CALIB"
+OBSERVED_IN = "OBSERVED_IN"
+
 # Mappings to/from heracles and spark_dsg
 SPARK_TO_HERACLES_LAYER_NAMES = MappingProxyType(
     {

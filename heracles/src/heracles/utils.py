@@ -44,11 +44,14 @@ def extract_labelspaces_from_dsg(G):
     return object_ls, room_ls
 
 
-def load_dsg_to_db(neo4j_uri, neo4j_creds, scene_graph):
+def load_dsg_to_db(neo4j_uri, neo4j_creds, scene_graph, image_store=None):
     """Load a DSG into Neo4j.
 
     Labelspaces must be embedded in the DSG metadata via ``set_labelspace()``.
     Use ``extract_labelspaces_from_dsg()`` to verify before calling.
+
+    ``image_store`` optionally adds the run's images (see
+    ``graph_interface.spark_dsg_to_db``); it needs ``hydra_python``.
     """
     # Set the layer id to layer name mappings
     spark_layer_id_to_heracles_layer_str = {
@@ -71,4 +74,4 @@ def load_dsg_to_db(neo4j_uri, neo4j_creds, scene_graph):
         initialize_db(db)
         # Load the scene graph into the DB
         print("Loading the scene graph into the database.")
-        spark_dsg_to_db(scene_graph, db)
+        spark_dsg_to_db(scene_graph, db, image_store=image_store)

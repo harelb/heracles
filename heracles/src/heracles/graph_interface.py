@@ -30,8 +30,10 @@ layer relationship (intralayer vs interlayer), not by attribute types.
 
 import datetime
 import logging
+import os
 
 import neo4j
+import numpy as np
 import parse
 import spark_dsg
 
@@ -90,6 +92,7 @@ def initialize_db(db):
     try_drop_index(db, "room_node_symbol")
     try_drop_index(db, "building_node_symbol")
     try_drop_index(db, "agent_node_symbol")
+    try_drop_index(db, "observation_node_symbol")
 
     db.execute(
         f"CREATE INDEX object_node_symbol FOR (n:{constants.OBJECTS}) ON (n.nodeSymbol)"
@@ -108,6 +111,9 @@ def initialize_db(db):
     )
     db.execute(
         f"CREATE INDEX agent_node_symbol FOR (n:{constants.AGENTS}) ON (n.nodeSymbol)"
+    )
+    db.execute(
+        f"CREATE INDEX observation_node_symbol FOR (n:{constants.OBSERVATIONS}) ON (n.nodeSymbol)"
     )
 
 
@@ -306,14 +312,34 @@ def insert_nodes_to_db(db, layer_label, node_dicts):
 # ---------------------------------------------------------------------------
 
 
-def add_objects_from_dsg(G, db, object_labelspace=None):
+def add_objects_from_dsg(G, db, store=None, object_labelspace=None):
+    """Insert Object nodes and, with an image ``store`` (see
+    :func:`open_image_store`), ``(:Object)-[:HAS_OBSERVATION]->(:Observation)``
+    for every store observation of each object (merged nodes included)."""
     if object_labelspace is None:
         object_labelspace = {}
-    nodes = [
-        node_to_dict(o, object_labelspace=object_labelspace)
-        for o in G.get_layer(spark_dsg.DsgLayers.OBJECTS).nodes
-    ]
+    objects = list(G.get_layer(spark_dsg.DsgLayers.OBJECTS).nodes)
+    nodes = [node_to_dict(o, object_labelspace=object_labelspace) for o in objects]
     insert_nodes_to_db(db, constants.OBJECTS, nodes)
+
+    if store is None:
+        return
+    observations = []
+    edges = []
+    for o in objects:
+        sym = o.id.str(True)
+        for d in _observation_dicts(sym, store.observations(int(o.id.value))):
+            observations.append(d)
+            edges.append({"from": sym, "to": d["nodeSymbol"]})
+    if observations:
+        insert_observations_to_db(db, observations)
+        insert_edges(
+            db,
+            constants.HAS_OBSERVATION,
+            constants.OBJECTS,
+            constants.OBSERVATIONS,
+            edges,
+        )
 
 
 def add_places_from_dsg(G, db):
@@ -428,15 +454,439 @@ def insert_agents_to_db(db, agents):
     )
 
 
-def add_agents_from_dsg(G, db):
+def add_agents_from_dsg(G, db, store=None):
     """Insert one ``Agent`` node per agent (keyframe) node of ``G``.
 
-    Returns the number of agents written.
+    With an image ``store``, each agent with its own keyframe (see
+    :func:`split_keyframes`) also gets ``frame_id`` and absolute ``rgb_path`` /
+    ``depth_path``, and the exact frame stamp as ``timestamp_ns``. Returns the
+    number of agents written.
     """
-    agents = [agent_to_dict(a) for a in _agent_nodes(G)]
+    keyframes = split_keyframes(G, store)[0] if store is not None else {}
+    agents = []
+    for a in _agent_nodes(G):
+        d = agent_to_dict(a)
+        f = keyframes.get(int(a.id.value))
+        if f is not None:
+            d["frame_id"] = int(f.frame_id)
+            d["rgb_path"] = _path_or_none(f.rgb_path)
+            d["depth_path"] = _path_or_none(f.depth_path)
+            # exact; the DSG attribute only has microsecond resolution
+            d["timestamp_ns"] = int(f.timestamp_ns)
+        agents.append(d)
     if agents:
         insert_agents_to_db(db, agents)
     return len(agents)
+
+
+# ---------------------------------------------------------------------------
+# Image store (hydra_python.image_store): keyframes, observations, cameras
+# ---------------------------------------------------------------------------
+
+
+class ImageStoreError(ValueError):
+    """Raised when an ``image_store`` argument cannot be opened as an image store."""
+
+
+def open_image_store(image_store, index=True):
+    """Return a read-only ``hydra_python.image_store.ImageStore``, or None.
+
+    ``image_store`` is a store directory, a run directory containing
+    ``image_store/``, a list of those (e.g. one per robot) or an open
+    ``ImageStore`` (returned as is). ``index`` is passed to ``ImageStore.open``:
+    it builds the store of a run that has only raw image logs. Returns None for
+    None or an empty list.
+    """
+    if image_store is None or (
+        isinstance(image_store, (list, tuple)) and len(image_store) == 0
+    ):
+        return None
+    from hydra_python.image_store import (
+        FrameKindError,
+        ImageStore,
+        SchemaVersionError,
+    )
+
+    if isinstance(image_store, ImageStore):
+        return image_store
+    if isinstance(image_store, (str, os.PathLike)):
+        image_store = [image_store]
+    paths = [os.path.abspath(os.path.expanduser(str(p))) for p in image_store]
+    try:
+        store = ImageStore.open(*paths, index=index)
+    except (FileNotFoundError, SchemaVersionError) as e:
+        raise ImageStoreError(f"cannot open image store {paths}: {e}") from e
+    try:
+        store.info()  # every frame kind must be one this reader knows
+    except FrameKindError as e:
+        store.close()
+        raise ImageStoreError(f"cannot read image store {paths}: {e}") from e
+    return store
+
+
+def _store_paths(store):
+    """The store directories of an open ``ImageStore``, as strings."""
+    return [str(r) for r in store.roots]
+
+
+def _node_symbol_str(node_id):
+    return spark_dsg.NodeSymbol(int(node_id)).str(True)
+
+
+def _path_or_none(p):
+    return None if p is None else str(p)
+
+
+# An agent node's own keyframe: the keyframe anchored to it within this time of
+# the node's stamp (``ImageStore.agent_frame``'s default).
+AGENT_FRAME_MAX_DT_NS = 50_000_000
+# Without a node stamp: the anchored keyframe taken at the node's own pose.
+_IDENTITY_ATOL = 1e-3
+
+
+def _agent_stamps(G):
+    """``agent node id -> stamp ns`` for every agent node of ``G`` with a stamp."""
+    out = {}
+    if G is None:
+        return out
+    for a in _agent_nodes(G):
+        ts = _agent_stamp_ns(a.attributes)
+        if ts is not None:
+            out[int(a.id.value)] = ts
+    return out
+
+
+def _anchor_offset(frame):
+    """Largest entry of ``anchor_T_body - I`` (0 when the frame has none)."""
+    if frame.anchor_T_body is None:
+        return 0.0
+    return float(np.max(np.abs(np.asarray(frame.anchor_T_body) - np.eye(4))))
+
+
+def split_keyframes(G, store):
+    """Split the store's keyframes into the agents' own keyframes and the others.
+
+    Every keyframe is anchored to the agent node nearest in time. An agent's own
+    keyframe is the one anchored to it within ``AGENT_FRAME_MAX_DT_NS`` of the
+    node's stamp in ``G``; for an agent without a stamp, the anchored keyframe
+    whose ``anchor_T_body`` is the identity. Returns ``(own, others)``:
+    ``{agent node id: Frame}`` and the other keyframes in time order (these
+    become ``SubKeyframe`` nodes).
+    """
+    from hydra_python.image_store import FrameKind
+
+    frames = store.frames(kind=FrameKind.KEYFRAME)
+    stamps = _agent_stamps(G)
+    by_anchor = {}
+    for f in frames:
+        if f.anchor_node_id is not None:
+            by_anchor.setdefault(int(f.anchor_node_id), []).append(f)
+    own = {}
+    for a, fs in by_anchor.items():
+        ts = stamps.get(a)
+        if ts is not None:
+            best = min(
+                fs, key=lambda f: (abs(f.timestamp_ns - ts), f.timestamp_ns, f.frame_id)
+            )
+            if abs(best.timestamp_ns - ts) <= AGENT_FRAME_MAX_DT_NS:
+                own[a] = best
+            continue
+        candidates = [f for f in fs if _anchor_offset(f) < _IDENTITY_ATOL]
+        if candidates:
+            own[a] = min(
+                candidates,
+                key=lambda f: (_anchor_offset(f), f.timestamp_ns, f.frame_id),
+            )
+    own_ids = {f.frame_id for f in own.values()}
+    return own, [f for f in frames if f.frame_id not in own_ids]
+
+
+def subkeyframe_symbol(frame_id):
+    """``nodeSymbol`` of a SubKeyframe node: ``s`` + the decimal store ``frame_id``.
+
+    Store frame ids embed the robot id, so the symbol is unique across robots.
+    """
+    return f"s{int(frame_id)}"
+
+
+def _rot_to_quat(R):
+    """3x3 rotation matrix -> unit quaternion (w, x, y, z) with w >= 0."""
+    R = np.asarray(R, dtype=float)
+    t = R[0, 0] + R[1, 1] + R[2, 2]
+    if t > 0.0:
+        s = 2.0 * np.sqrt(t + 1.0)
+        q = [
+            0.25 * s,
+            (R[2, 1] - R[1, 2]) / s,
+            (R[0, 2] - R[2, 0]) / s,
+            (R[1, 0] - R[0, 1]) / s,
+        ]
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        q = [
+            (R[2, 1] - R[1, 2]) / s,
+            0.25 * s,
+            (R[0, 1] + R[1, 0]) / s,
+            (R[0, 2] + R[2, 0]) / s,
+        ]
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        q = [
+            (R[0, 2] - R[2, 0]) / s,
+            (R[0, 1] + R[1, 0]) / s,
+            0.25 * s,
+            (R[1, 2] + R[2, 1]) / s,
+        ]
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        q = [
+            (R[1, 0] - R[0, 1]) / s,
+            (R[0, 2] + R[2, 0]) / s,
+            (R[1, 2] + R[2, 1]) / s,
+            0.25 * s,
+        ]
+    q = np.array(q) / np.linalg.norm(q)
+    return -q if q[0] < 0 else q
+
+
+def subkeyframe_to_dict(frame, pose):
+    """One SubKeyframe row from a store keyframe that is not an agent's own.
+
+    ``pose`` is the 4x4 world_T_body: the anchor agent's pose composed with the
+    frame's anchor_T_body, or odometry when the anchor is unknown.
+    """
+    q = _rot_to_quat(pose[:3, :3])
+    d = {
+        "nodeSymbol": subkeyframe_symbol(frame.frame_id),
+        "frame_id": int(frame.frame_id),
+        "pos_x": float(pose[0, 3]),
+        "pos_y": float(pose[1, 3]),
+        "pos_z": float(pose[2, 3]),
+        "rot_w": float(q[0]),
+        "rot_x": float(q[1]),
+        "rot_y": float(q[2]),
+        "rot_z": float(q[3]),
+        "timestamp_ns": int(frame.timestamp_ns),
+        "rgb_path": _path_or_none(frame.rgb_path),
+        "depth_path": _path_or_none(frame.depth_path),
+        "sensor_id": int(frame.sensor_id),
+    }
+    if frame.anchor_node_id is not None:
+        d["anchor_symbol"] = _node_symbol_str(frame.anchor_node_id)
+    return d
+
+
+def insert_subkeyframes_to_db(db, subframes):
+    return db.execute(
+        f"""
+    WITH $subframes AS subframes
+    UNWIND subframes AS s
+    MERGE (n:{constants.SUBKEYFRAMES} {{nodeSymbol: s.nodeSymbol}})
+    SET n.center = point({{x: s.pos_x, y: s.pos_y, z: s.pos_z}}),
+        n.rot_w = s.rot_w, n.rot_x = s.rot_x, n.rot_y = s.rot_y, n.rot_z = s.rot_z,
+        n.frame_id = s.frame_id,
+        n.rgb_path = s.rgb_path,
+        n.depth_path = s.depth_path,
+        n.timestamp_ns = s.timestamp_ns
+    """,
+        subframes=subframes,
+    )
+
+
+def add_subkeyframes_from_dsg(G, db, store):
+    """Insert a ``SubKeyframe`` node for every store keyframe that is not an
+    agent's own keyframe (:func:`split_keyframes`), with
+    ``(:SubKeyframe)-[:ANCHORED_TO]->(:Agent)`` when it is anchored.
+
+    The pose is the anchor agent's pose in ``G`` composed with the frame's
+    anchor_T_body (odometry when the anchor is not in ``G``). Returns the number
+    of SubKeyframe nodes written.
+    """
+    if store is None:
+        return 0
+    subframes = [
+        subkeyframe_to_dict(f, store.body_pose(f, G)[0])
+        for f in split_keyframes(G, store)[1]
+    ]
+    if not subframes:
+        return 0
+    insert_subkeyframes_to_db(db, subframes)
+    edges = [
+        {"from": s["nodeSymbol"], "to": s["anchor_symbol"]}
+        for s in subframes
+        if "anchor_symbol" in s
+    ]
+    insert_edges(
+        db, constants.ANCHORED_TO, constants.SUBKEYFRAMES, constants.AGENTS, edges
+    )
+    return len(subframes)
+
+
+def _observation_dicts(obj_symbol, observations):
+    """Observation rows for one object node, one per store observation.
+
+    ``nodeSymbol`` is ``<obj>_<timestamp_ns>``; when two observations of the
+    object share a timestamp the later one gets ``_<obs_id>`` appended.
+    """
+    out, seen = [], set()
+    for ob in observations:
+        sym = f"{obj_symbol}_{ob.timestamp_ns}"
+        if sym in seen:
+            sym = f"{sym}_{ob.obs_id}"
+        seen.add(sym)
+        d = {
+            "nodeSymbol": sym,
+            "timestamp_ns": int(ob.timestamp_ns),
+            "obs_id": int(ob.obs_id),
+            "frame_id": int(ob.frame_id),
+            "rgb_path": _path_or_none(ob.rgb_path),
+            "depth_path": _path_or_none(ob.depth_path),
+            "mask_path": _path_or_none(ob.mask_path),
+            "mask_file": os.path.basename(str(ob.mask_path)) if ob.mask_path else None,
+            # every observation has an RLE mask; only kept ones have a PNG
+            "mask_rle": ob.mask_rle or None,
+            "score": float(ob.score),
+            "kept": bool(ob.kept),
+        }
+        if ob.bbox2d is not None:
+            x0, y0, x1, y1 = (int(v) for v in ob.bbox2d)
+            d["bbox_2d"] = [x0, y0, x1, y1]
+        out.append(d)
+    return out
+
+
+def insert_observations_to_db(db, observations):
+    # MERGE on nodeSymbol only, so re-ingesting updates in place.
+    return db.execute(
+        f"""
+    WITH $observations AS observations
+    UNWIND observations AS obs
+    MERGE (o:{constants.OBSERVATIONS} {{nodeSymbol: obs.nodeSymbol}})
+    SET o.timestamp_ns = obs.timestamp_ns,
+        o.obs_id = obs.obs_id,
+        o.frame_id = obs.frame_id,
+        o.rgb_path = obs.rgb_path,
+        o.depth_path = obs.depth_path,
+        o.mask_path = obs.mask_path,
+        o.mask_file = obs.mask_file,
+        o.mask_rle = obs.mask_rle,
+        o.bbox_2d = obs.bbox_2d,
+        o.score = obs.score,
+        o.kept = obs.kept
+    """,
+        observations=observations,
+    )
+
+
+# Frame-bearing labels an Observation is linked to by capture timestamp.
+_FRAME_LABELS = (constants.AGENTS, constants.SUBKEYFRAMES)
+
+
+def ensure_provenance_indexes(db):
+    """Idempotent indexes backing :func:`link_observations_to_frames` and
+    :func:`attach_camera_calibs`."""
+    for label in _FRAME_LABELS + (constants.OBSERVATIONS,):
+        db.execute(
+            f"CREATE INDEX {label.lower()}_timestamp_ns IF NOT EXISTS "
+            f"FOR (n:{label}) ON (n.timestamp_ns)"
+        )
+    db.execute(
+        f"CREATE INDEX {constants.CAMERA_CALIBS.lower()}_calib_id IF NOT EXISTS "
+        f"FOR (n:{constants.CAMERA_CALIBS}) ON (n.calib_id)"
+    )
+
+
+def link_observations_to_frames(db):
+    """MERGE ``(:Observation)-[:OBSERVED_IN]->(frame)`` for every Agent or
+    SubKeyframe captured at the observation's ``timestamp_ns``.
+
+    Observations of frames that are not keyframes get no edge. Returns the
+    number of matched (observation, frame) pairs.
+    """
+    ensure_provenance_indexes(db)
+    total = 0
+    for label in _FRAME_LABELS:
+        records, _, _ = db.execute(
+            f"""
+        MATCH (o:{constants.OBSERVATIONS}) WHERE o.timestamp_ns IS NOT NULL
+        MATCH (f:{label} {{timestamp_ns: o.timestamp_ns}})
+        MERGE (o)-[:{constants.OBSERVED_IN}]->(f)
+        RETURN count(*) AS n
+        """
+        )
+        total += records[0]["n"] if records else 0
+    return total
+
+
+def _calib_to_dict(calib):
+    """Flat CameraCalib row from a store ``Calib`` (sensor)."""
+    return {
+        "calib_id": str(int(calib.sensor_id)),
+        "sensor_id": int(calib.sensor_id),
+        "fx": float(calib.fx),
+        "fy": float(calib.fy),
+        "cx": float(calib.cx),
+        "cy": float(calib.cy),
+        "width": int(calib.width),
+        "height": int(calib.height),
+        "depth_scale": float(calib.depth_scale),
+        "body_T_sensor": [
+            float(v) for v in np.asarray(calib.body_T_sensor).reshape(-1)
+        ],
+    }
+
+
+def attach_camera_calibs(db, store, G=None):
+    """Insert a ``CameraCalib`` node per store sensor (``calib_id`` is the
+    decimal ``sensor_id``) and ``HAS_CALIB`` edges to it from every Agent and
+    anchored SubKeyframe. ``G`` supplies the agent stamps that pick each agent's
+    own keyframe (:func:`split_keyframes`). Returns the number of edges written.
+    """
+    ensure_provenance_indexes(db)
+    calibs = [_calib_to_dict(c) for c in store.sensors() if c is not None]
+    if not calibs:
+        return 0
+    db.execute(
+        f"""
+    UNWIND $calibs AS c
+    MERGE (n:{constants.CAMERA_CALIBS} {{calib_id: c.calib_id}})
+    SET n.sensor_id = c.sensor_id,
+        n.fx = c.fx, n.fy = c.fy, n.cx = c.cx, n.cy = c.cy,
+        n.width = c.width, n.height = c.height,
+        n.depth_scale = c.depth_scale, n.body_T_sensor = c.body_T_sensor
+    """,
+        calibs=calibs,
+    )
+    known = {c["sensor_id"] for c in calibs}
+    own, others = split_keyframes(G, store)
+    agent_pairs = [
+        {"ns": _node_symbol_str(a), "calib_id": str(int(f.sensor_id))}
+        for a, f in own.items()
+        if int(f.sensor_id) in known
+    ]
+    sub_pairs = [
+        {"ns": subkeyframe_symbol(f.frame_id), "calib_id": str(int(f.sensor_id))}
+        for f in others
+        if f.anchor_node_id is not None and int(f.sensor_id) in known
+    ]
+    n_edges = 0
+    for label, pairs in (
+        (constants.AGENTS, agent_pairs),
+        (constants.SUBKEYFRAMES, sub_pairs),
+    ):
+        if not pairs:
+            continue
+        db.execute(
+            f"""
+        UNWIND $pairs AS pair
+        MATCH (n:{label} {{nodeSymbol: pair.ns}})
+        MATCH (c:{constants.CAMERA_CALIBS} {{calib_id: pair.calib_id}})
+        MERGE (n)-[:{constants.HAS_CALIB}]->(c)
+        """,
+            pairs=pairs,
+        )
+        n_edges += len(pairs)
+    return n_edges
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +894,7 @@ def add_agents_from_dsg(G, db):
 # ---------------------------------------------------------------------------
 
 
-def spark_dsg_to_db(G, db, source_file_path=None):
+def spark_dsg_to_db(G, db, source_file_path=None, image_store=None):
     """Load all nodes and edges from a spark_dsg graph into Neo4j.
 
     Extracts labelspaces from DSG metadata (embedded ``"labelspaces"`` key)
@@ -454,18 +904,37 @@ def spark_dsg_to_db(G, db, source_file_path=None):
     If ``source_file_path`` is provided, it is stored as a ``_GraphMetadata``
     node so that downstream tools (e.g., SGET) can locate the original file
     on disk for mesh data and other large assets not stored in Neo4j.
+
+    ``image_store`` (anything :func:`open_image_store` accepts) adds the
+    images Hydra recorded for the graph: keyframe paths on Agent nodes,
+    SubKeyframe nodes for the other keyframes, Observation nodes for the
+    objects, CameraCalib nodes, and the store directories as
+    ``_GraphMetadata {key: 'image_store'}.image_store_paths``.
     """
     from .utils import extract_labelspaces_from_dsg
 
+    store = open_image_store(image_store)
     object_ls, room_ls = extract_labelspaces_from_dsg(G)
 
-    add_agents_from_dsg(G, db)
-    add_objects_from_dsg(G, db, object_labelspace=object_ls)
+    add_agents_from_dsg(G, db, store)
+    add_objects_from_dsg(G, db, store, object_labelspace=object_ls)
     add_places_from_dsg(G, db)
     add_mesh_places_from_dsg(G, db, object_labelspace=object_ls)
     add_rooms_from_dsg(G, db, room_labelspace=room_ls)
     add_buildings_from_dsg(G, db)
     add_edges_from_dsg(G, db)
+
+    if store is not None:
+        add_subkeyframes_from_dsg(G, db, store)
+        attach_camera_calibs(db, store, G)
+        link_observations_to_frames(db)
+        db.execute(
+            "MERGE (m:_GraphMetadata {key: 'image_store'}) "
+            "SET m.image_store_paths = $paths",
+            paths=_store_paths(store),
+        )
+        if store is not image_store:
+            store.close()
 
     # Store labelspaces in Neo4j so db_to_spark_dsg() can reconstruct
     # without requiring external YAML files or function arguments.
@@ -489,8 +958,6 @@ def spark_dsg_to_db(G, db, source_file_path=None):
         )
 
     if source_file_path is not None:
-        import os
-
         abs_path = os.path.abspath(source_file_path)
         db.execute(
             "MERGE (m:_GraphMetadata {key: 'source'}) SET m.file_path = $path",
@@ -509,8 +976,6 @@ def store_mesh_path(db, mesh_path, mesh_format=None):
     Stored as ``file_path`` / ``format`` on ``_GraphMetadata {key: 'mesh'}``.
     ``mesh_format`` defaults to the file extension (e.g. ``"ply"``).
     """
-    import os
-
     abs_path = os.path.abspath(str(mesh_path))
     fmt = mesh_format or os.path.splitext(abs_path)[1].lstrip(".").lower() or "ply"
     db.execute(
