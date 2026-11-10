@@ -104,8 +104,8 @@ class SceneChangeWriter(Node):
         # Observations less sure than this are dropped.
         self.declare_parameter("min_confidence", 0.0)
         # The original map that rebuilds start from: the file Neo4j was seeded
-        # from (heracles publisher, seed_on_start), unless set here. A map that
-        # was not seeded from a file is never replaced by one.
+        # or loaded from (map_state.get_prior_path), unless set here. A map that
+        # was not loaded from a file is never replaced by one.
         self.declare_parameter("prior_dsg_path", "")
         self.declare_parameter("snapshot_sources", ["awcd/"])
         # An added object reported again this far from where the map has it moves.
@@ -273,6 +273,7 @@ class SceneChangeWriter(Node):
                 "The map was not seeded from a scene graph file (and prior_dsg_path is "
                 "not set), so there is no original to rebuild it from."
             )
+            self.get_logger().warn(f"{source}: {response.message}")
             return response
         change_log.deactivate(self.db, [e["seq"] for e in entries])
         restored = self._rebuild()
