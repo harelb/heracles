@@ -8,13 +8,14 @@ from dsg_updater.dsg_state_utils import robot_hold_obj, robot_unhold_obj, set_ob
 from geometry_msgs.msg import TransformStamped
 from heracles.query_interface import Neo4jWrapper
 from heracles_agents.dsg_interfaces import HeraclesDsgInterface
+from heracles_ros_interfaces.msg import SceneChangeMsg
 from heracles_ros_interfaces.srv import UpdateHoldingState
 from rclpy.node import Node
 
+from heracles_ros.change_log import record
 from heracles_ros.map_state import notify_map_change
 from heracles_ros.scene_change import MOVED, object_center
 from heracles_ros.scene_change_writer_node import applied_msg
-from heracles_ros_interfaces.msg import SceneChangeMsg
 
 
 class HeraclesStateUpdater(Node):
@@ -156,6 +157,15 @@ class HeraclesStateUpdater(Node):
                     last_pos_success = set_obj_center(db, object_id, *put_at)
                     response.success = last_pos_success and unhold_success
             if response.success:
+                if not is_holding:
+                    # Logged, so a rebuild of the map keeps the object where
+                    # the robot put it.
+                    record(
+                        db,
+                        f"executor/{robot_name}",
+                        "move_object",
+                        {"symbol": object_id, "xyz": [float(v) for v in put_at]},
+                    )
                 # both counters: the publisher's _MapState and the console's _State
                 _, version = notify_map_change(db, ["objects"], [object_id])
                 if not is_holding:
@@ -163,8 +173,14 @@ class HeraclesStateUpdater(Node):
                         applied_msg(
                             f"executor/{robot_name}",
                             version,
-                            [{"kind": MOVED, "symbol": object_id, "old": was_at,
-                              "new": tuple(put_at)}],
+                            [
+                                {
+                                    "kind": MOVED,
+                                    "symbol": object_id,
+                                    "old": was_at,
+                                    "new": tuple(put_at),
+                                }
+                            ],
                             self.get_clock().now().to_msg(),
                         )
                     )

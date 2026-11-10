@@ -14,10 +14,15 @@ Positions are written everywhere the map keeps them: center and bbox_center
 (what the published scene graph reads) and pos_x / pos_y / pos_z (what Cypher
 queries read). The CONTAINS edge from the nearest mesh place is redone, so
 queries for "objects in this place" stay right.
+
+Places (MeshPlace nodes) and the connections between them are edited here
+too, for map edits by language (SGET): the change log (change_log.py) replays
+every edit through these same functions when it rebuilds the map.
 """
 
 from __future__ import annotations
 
+import json
 import time
 from typing import List, Optional
 
@@ -88,8 +93,18 @@ def _set_position(db, symbol, xyz):
 
 
 def _next_object_symbol(db) -> str:
+    """The next object symbol never used in this run.
+
+    Symbols of objects added and later undone count as used: an old goal
+    naming one must not silently mean a new object.
+    """
     rows = db.execute("MATCH (o:Object) RETURN o.nodeSymbol AS s")[0]
-    taken = [int(r["s"][1:]) for r in rows if r["s"] and r["s"][1:].isdigit()]
+    used = [r["s"] for r in rows]
+    logged = db.execute("MATCH (c:_SceneChange {op: 'add_object'}) RETURN c.data AS d")[
+        0
+    ]
+    used += [json.loads(r["d"]).get("symbol", "") for r in logged]
+    taken = [int(s[1:]) for s in used if s and s[1:].isdigit()]
     return f"O{max(taken, default=-1) + 1}"
 
 
@@ -184,3 +199,130 @@ def apply_changes(db, changes) -> List[dict]:
         if done is not None:
             applied.append(done)
     return applied
+
+
+def place_exists(db, symbol) -> bool:
+    rows = db.execute(
+        "MATCH (p:MeshPlace {nodeSymbol: $s}) RETURN p.nodeSymbol AS s", **{"s": symbol}
+    )[0]
+    return bool(rows)
+
+
+def next_place_symbol(db) -> str:
+    rows = db.execute(
+        "MATCH (p:MeshPlace) RETURN max(toInteger(substring(p.nodeSymbol, 1))) AS n"
+    )[0]
+    top = rows[0]["n"] if rows else None
+    return f"t{(top or 0) + 1}"
+
+
+def add_place(db, symbol, x, y, neighbours) -> Optional[dict]:
+    """A traversable place at (x, y), connected both ways to existing places.
+
+    It copies its nearest place's attributes (type, clearance, ...) except for
+    where it is, so the scene graph can be built from it. None if the symbol
+    is taken or a neighbour does not exist.
+    """
+    neighbours = [n.strip().lower() for n in neighbours if n.strip()]
+    symbol = (symbol or "").strip().lower() or next_place_symbol(db)
+    if place_exists(db, symbol) or not neighbours:
+        return None
+    known = db.execute(
+        "MATCH (p:MeshPlace) WHERE p.nodeSymbol IN $n RETURN p.nodeSymbol AS s",
+        **{"n": neighbours},
+    )[0]
+    if len({r["s"] for r in known}) != len(set(neighbours)):
+        return None
+    x, y = float(x), float(y)
+    db.execute(
+        """
+        MATCH (src:MeshPlace)
+        WITH src, (src.pos_x - $x)^2 + (src.pos_y - $y)^2 AS d ORDER BY d LIMIT 1
+        CREATE (p:MeshPlace) SET p = properties(src),
+            p.nodeSymbol = $s, p.center = point({x: $x, y: $y, z: 0.0}),
+            p.pos_x = $x, p.pos_y = $y, p.pos_z = 0.0
+        """,
+        **{"s": symbol, "x": x, "y": y},
+    )
+    db.execute(
+        """
+        MATCH (p:MeshPlace {nodeSymbol: $s}), (q:MeshPlace) WHERE q.nodeSymbol IN $n
+        CREATE (p)-[:MESH_PLACE_CONNECTED]->(q), (q)-[:MESH_PLACE_CONNECTED]->(p)
+        """,
+        **{"s": symbol, "n": neighbours},
+    )
+    return {"symbol": symbol, "x": x, "y": y, "neighbours": neighbours}
+
+
+def remove_place(db, symbol) -> Optional[dict]:
+    """Delete a place with all its edges. None if there is no such place.
+
+    Objects it contained move to their nearest remaining place, so they stay
+    in the map.
+    """
+    symbol = (symbol or "").strip().lower()
+    if not place_exists(db, symbol):
+        return None
+    rows = db.execute(
+        """
+        MATCH (p:MeshPlace {nodeSymbol: $s})
+        OPTIONAL MATCH (p)-[r]-()
+        RETURN count(r) AS edges
+        """,
+        **{"s": symbol},
+    )[0]
+    contained = db.execute(
+        "MATCH (:MeshPlace {nodeSymbol: $s})-[:CONTAINS]->(o:Object) RETURN o.nodeSymbol AS o",
+        **{"s": symbol},
+    )[0]
+    db.execute("MATCH (p:MeshPlace {nodeSymbol: $s}) DETACH DELETE p", **{"s": symbol})
+    for r in contained:
+        _relink_to_nearest_place(db, r["o"])
+    return {
+        "symbol": symbol,
+        "edges": int(rows[0]["edges"]),
+        "objects": [r["o"] for r in contained],
+    }
+
+
+def _connections(db, a, b) -> int:
+    rows = db.execute(
+        """
+        MATCH (p:MeshPlace {nodeSymbol: $a})-[r:MESH_PLACE_CONNECTED]-(q:MeshPlace {nodeSymbol: $b})
+        RETURN count(r) AS n
+        """,
+        **{"a": a, "b": b},
+    )[0]
+    return int(rows[0]["n"]) if rows else 0
+
+
+def remove_connection(db, a, b) -> Optional[dict]:
+    """Delete the connection between two places, both directions."""
+    a, b = (a or "").strip().lower(), (b or "").strip().lower()
+    if not _connections(db, a, b):
+        return None
+    db.execute(
+        """
+        MATCH (p:MeshPlace {nodeSymbol: $a})-[r:MESH_PLACE_CONNECTED]-(q:MeshPlace {nodeSymbol: $b})
+        DELETE r
+        """,
+        **{"a": a, "b": b},
+    )
+    return {"a": a, "b": b}
+
+
+def add_connection(db, a, b) -> Optional[dict]:
+    """Connect two existing places both ways (no-op if already connected)."""
+    a, b = (a or "").strip().lower(), (b or "").strip().lower()
+    if a == b or not (place_exists(db, a) and place_exists(db, b)):
+        return None
+    if _connections(db, a, b):
+        return None
+    db.execute(
+        """
+        MATCH (p:MeshPlace {nodeSymbol: $a}), (q:MeshPlace {nodeSymbol: $b})
+        CREATE (p)-[:MESH_PLACE_CONNECTED]->(q), (q)-[:MESH_PLACE_CONNECTED]->(p)
+        """,
+        **{"a": a, "b": b},
+    )
+    return {"a": a, "b": b}
