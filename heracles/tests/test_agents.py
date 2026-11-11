@@ -6,7 +6,9 @@ cleared). Configure it with HERACLES_TEST_NEO4J_URI / HERACLES_TEST_NEO4J_PASSWO
 
 import os
 
+import numpy as np
 import pytest
+import spark_dsg
 from dsg_fixture import build_dsg
 
 from heracles import constants
@@ -81,3 +83,30 @@ def test_spark_dsg_to_db_writes_agent_edges(db):
         "RETURN p.nodeSymbol AS f, a.nodeSymbol AS t"
     )
     assert [(r["f"], r["t"]) for r in records] == [("p0", "a1")]
+
+
+def _with_mesh_place(G):
+    """Put agent a0 in a mesh place (layer 3, partition 1), as Hydra does."""
+    mp = spark_dsg.TravNodeAttributes()
+    mp.position = np.array([0.5, 0.5, 0.0])
+    mp_id = spark_dsg.NodeSymbol("t", 0).value
+    G.add_node(spark_dsg.DsgLayers.MESH_PLACES, mp_id, mp)
+    G.insert_edge(mp_id, spark_dsg.NodeSymbol("a", 0).value)
+    return G
+
+
+def test_agent_edges_to_mesh_places():
+    _, place_agent = gi.agent_edges(_with_mesh_place(build_dsg()))
+    assert sorted(place_agent, key=lambda e: e["to"]) == [
+        {"from": "t0", "to": "a0", "label": constants.MESH_PLACES},
+        {"from": "p0", "to": "a1", "label": constants.PLACES},
+    ]
+
+
+def test_spark_dsg_to_db_writes_mesh_place_agent_edges(db):
+    gi.spark_dsg_to_db(_with_mesh_place(build_dsg()), db)
+    records, _, _ = db.execute(
+        f"MATCH (p:{constants.MESH_PLACES})-[:CONTAINS]->(a:{constants.AGENTS}) "
+        "RETURN p.nodeSymbol AS f, a.nodeSymbol AS t"
+    )
+    assert [(r["f"], r["t"]) for r in records] == [("t0", "a0")]

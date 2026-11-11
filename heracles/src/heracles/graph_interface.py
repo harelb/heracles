@@ -361,7 +361,14 @@ def add_buildings_from_dsg(G, db):
 
 
 def _agent_stamp_ns(attrs):
-    """Agent node stamp in ns, None when unset (the binding defaults it to 0)."""
+    """Agent node stamp in ns, None when unset (the binding defaults it to 0).
+
+    The Python binding returns the stamp as a ``datetime.timedelta``, so the
+    value has microsecond resolution (the last three digits are 0). Looking up
+    the node's keyframe with ``hydra_python.image_store.ImageStore.agent_frame``
+    goes by the agent node id and the nearest stamp within 50 ms, so this does
+    not change which frame is found.
+    """
     ts = getattr(attrs, "timestamp", None)
     if ts is None:
         return None
@@ -406,8 +413,7 @@ def agent_to_dict(agent):
 
 
 def insert_agents_to_db(db, agents):
-    """MERGE ``Agent`` nodes. Image properties (``frame_id``, ``rgb_path``,
-    ``depth_path``) are only overwritten when the row has them."""
+    """MERGE ``Agent`` nodes (pose and stamp)."""
     return db.execute(
         f"""
     WITH $agents AS agents
@@ -419,9 +425,6 @@ def insert_agents_to_db(db, agents):
         n.rot_x = agent.rot_x,
         n.rot_y = agent.rot_y,
         n.rot_z = agent.rot_z,
-        n.frame_id = coalesce(agent.frame_id, n.frame_id),
-        n.rgb_path = coalesce(agent.rgb_path, n.rgb_path),
-        n.depth_path = coalesce(agent.depth_path, n.depth_path),
         n.timestamp_ns = coalesce(agent.timestamp_ns, n.timestamp_ns)
     """,
         agents=agents,
@@ -440,16 +443,24 @@ def add_agents_from_dsg(G, db):
     return len(agents)
 
 
-_AGENT_PLACE_LAYERS = {3: constants.PLACES, 20: constants.MESH_PLACES}
+def _layer_key(name):
+    key = spark_dsg.DsgLayers.name_to_layer_id(name)
+    return (key.layer, key.partition)
+
+
+# (layer, partition) of the place layers an agent can be in; 20 is the layer id
+# mesh places had before they became partition 1 of the places layer.
+_AGENT_PLACE_LAYERS = {
+    _layer_key("PLACES"): constants.PLACES,
+    _layer_key("MESH_PLACES"): constants.MESH_PLACES,
+    (20, 0): constants.MESH_PLACES,
+}
 
 
 def _place_label(G, node_id):
-    """Heracles label of a place-layer node (places or mesh places), else None."""
-    node = G.get_node(node_id)
-    label = _AGENT_PLACE_LAYERS.get(node.layer.layer)
-    if label is None and node.layer.layer == 3 and node.layer.partition != 0:
-        label = constants.MESH_PLACES  # mesh places as a partition of layer 3
-    return label
+    """Heracles label of a place or mesh place node, else None."""
+    layer = G.get_node(node_id).layer
+    return _AGENT_PLACE_LAYERS.get((layer.layer, layer.partition))
 
 
 def agent_edges(G):
