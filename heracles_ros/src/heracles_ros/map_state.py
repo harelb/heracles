@@ -35,10 +35,12 @@ from typing import Dict, List
 import spark_dsg
 from heracles.map_reload import (  # noqa: F401  re-exported for map writers
     REBUILD_STALE_S,
+    bump_map_version,
     get_map_epoch,
     get_map_version,
     is_rebuilding,
     mark_rebuild_failed,
+    read_map_change,
     rebuild_state,
     reloading_map,
     set_rebuilding,
@@ -52,23 +54,15 @@ _MAP_STATE = "_MapState"
 _CONSOLE_STATE = "_State"
 
 
-def bump_map_version(db) -> int:
-    rows = db.query(
-        f"MERGE (m:{_MAP_STATE}) "
-        "SET m.version = coalesce(m.version, 0) + 1 "
-        "RETURN m.version AS v"
-    )
-    return int(rows[0]["v"])
-
-
-def notify_map_change(db) -> int:
+def notify_map_change(db, changed_layers=None, changed_ids=None) -> int:
     """Bump the map version, and the console's counter if there is one.
 
     For every edit of the map: the publisher and planners watch the version,
     the console's viewers poll its ``_State`` node. That node is only matched,
     never created, so without a console this is bump_map_version.
+    ``changed_layers`` / ``changed_ids``: see bump_map_version.
     """
-    version = bump_map_version(db)
+    version = bump_map_version(db, changed_layers, changed_ids)
     db.execute(
         f"MATCH (s:{_CONSOLE_STATE}) "
         "SET s.version = coalesce(s.version, 0) + 1, s.updated = $t",

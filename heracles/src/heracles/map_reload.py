@@ -85,6 +85,63 @@ def get_map_version(db) -> int:
     return int(rows[0]["v"]) if rows and rows[0]["v"] is not None else 0
 
 
+BUMP_MAP_VERSION = (
+    f"MERGE (m:{MAP_STATE}) "
+    "SET m.version = coalesce(m.version, 0) + 1 "
+    "SET m.changed_version = m.version, m.changed_layers = $layers, "
+    "m.changed_ids = $ids "
+    "RETURN m.version AS v"
+)
+# How many changed node ids a bump records; past that a reader reloads everything.
+MAX_CHANGED_IDS = 500
+
+
+def changed_params(changed_layers=None, changed_ids=None) -> dict:
+    """BUMP_MAP_VERSION's parameters (None: what changed is not known)."""
+    layers = None if changed_layers is None else [str(x) for x in changed_layers]
+    ids = None if changed_ids is None else [str(x) for x in changed_ids]
+    if ids is not None and len(ids) > MAX_CHANGED_IDS:
+        ids = None
+    return {"layers": layers, "ids": ids}
+
+
+def bump_map_version(db, changed_layers=None, changed_ids=None) -> int:
+    """Bump the map version after a change to the map; returns the new version.
+
+    A writer that knows what it changed passes the layers (``"layer:partition"``
+    strings) and node symbols, so a reader that holds the map at the previous
+    version can re-read only those (``read_map_change``). Without them the
+    change is recorded as unknown, i.e. everything.
+    """
+    records, _, _ = db.execute(
+        BUMP_MAP_VERSION, **changed_params(changed_layers, changed_ids)
+    )
+    return int(records[0]["v"])
+
+
+def read_map_change(db):
+    """``(version, changed_layers, changed_ids)`` of the last version bump.
+
+    The two lists are None when what made this version is not known: the
+    writer did not say, or the version was not made by ``bump_map_version``
+    (a reload sets it directly). A reader that holds the map at exactly
+    ``version - 1`` may re-read only the changed nodes; otherwise it reloads.
+    """
+    rows = db.query(
+        f"MATCH (m:{MAP_STATE}) RETURN m.version AS v, m.changed_version AS cv, "
+        "m.changed_layers AS layers, m.changed_ids AS ids"
+    )
+    if not rows or rows[0]["v"] is None:
+        return 0, None, None
+    row = rows[0]
+    version = int(row["v"])
+    if row["cv"] != version:
+        return version, None, None
+    layers = None if row["layers"] is None else list(row["layers"])
+    ids = None if row["ids"] is None else list(row["ids"])
+    return version, layers, ids
+
+
 def get_map_epoch(db) -> str:
     rows = db.query(f"MATCH (m:{MAP_STATE}) RETURN m.epoch AS e")
     return (rows[0]["e"] or "") if rows else ""
