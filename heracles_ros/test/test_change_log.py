@@ -147,6 +147,8 @@ class _Writer:
     _on_snapshot = SceneChangeWriter._on_snapshot
     _wanted = SceneChangeWriter._wanted
     _can_rebuild = SceneChangeWriter._can_rebuild
+    _prior_problem = SceneChangeWriter._prior_problem
+    _rebuild_log = SceneChangeWriter._rebuild_log
     _rebuild = SceneChangeWriter._rebuild
     _announce = SceneChangeWriter._announce
 
@@ -255,7 +257,33 @@ def test_the_writer_rebuilds_only_from_the_file_neo4j_was_seeded_from(db, prior)
     assert get_prior_path(db) == os.path.abspath(DSG_PATH)
     w = _Writer(db, prior)
     assert w._can_rebuild()
-    db.query("MATCH (m:_MapState) REMOVE m.prior_path")  # filled some other way
+    # filled some other way: neither the seed's path nor the loader's source
+    db.query("MATCH (m:_MapState) REMOVE m.prior_path")
+    db.query("MATCH (m:_GraphMetadata {key: 'source'}) REMOVE m.file_path")
     assert not w._can_rebuild()
     w.prior_param = DSG_PATH  # unless set explicitly
     assert w._can_rebuild()
+
+
+def test_an_edit_and_its_log_entry_commit_together_in_map_edit(db):
+    """Found in the local e2e: the first SGET edit failed with "Transaction
+    failed", because logging it tried to create the log's seq constraint
+    (schema) inside the edit's write transaction, which Neo4j refuses."""
+    from heracles_ros.map_state import map_edit, notify_map_change
+
+    db.execute("DROP CONSTRAINT scene_change_seq IF EXISTS")
+    fresh = _connect()  # a new connection: it has not made the schema yet
+    v = get_map_version(fresh)
+    with map_edit(fresh) as tx:
+        assert tx is not None
+        # as SGET's remove_scene_place logs it
+        place = _a_place_with_neighbours(tx)[0]
+        assert remove_place(tx, place) is not None
+        change_log.record(tx, "sget/test", "remove_place", {"symbol": place})
+        notify_map_change(tx)
+    fresh.close()
+    assert get_map_version(db) == v + 1
+    (entry,) = change_log.entries(db)
+    assert entry["op"] == "remove_place" and entry["source"] == "sget/test"
+    rows = db.query("SHOW CONSTRAINTS YIELD name WHERE name = 'scene_change_seq' RETURN name")
+    assert rows  # made, outside the edit

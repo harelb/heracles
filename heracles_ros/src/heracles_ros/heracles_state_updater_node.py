@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+"""Robot poses and what robots hold, kept in Neo4j.
+
+Each executor reports a pick or a place through ~/update_holding_state in its
+own namespace. That call can be lost on the way to the base (it was, in the
+field), and then the map keeps a carried object where it was picked. So the
+same results are also taken from the executors' /action_done reports
+(robot_executor_msgs/ActionDoneMsg): PICK SUCCESS holds the object, PLACE
+SUCCESS releases it at the reported point, or at the robot if there is none.
+Whichever of the two arrives second finds the map already updated and changes
+nothing, so an object is never moved twice.
+"""
+
+import time
 from functools import partial
 
 import rclpy
@@ -14,8 +27,16 @@ from rclpy.node import Node
 
 from heracles_ros.change_log import record
 from heracles_ros.map_state import bump_map_version
-from heracles_ros.scene_change import MOVED, object_center
+from heracles_ros.scene_change import MOVED, holder_of, object_center
 from heracles_ros.scene_change_writer_node import applied_msg
+
+# An object released this close to where the map already has it, by a robot
+# not holding it, was already placed (by the other of service and /action_done).
+ALREADY_PLACED_M = 0.1
+ALREADY = "already"
+# A PICK report for an object its robot released this recently is a late one,
+# from before the place: holding it again would put it back on the robot.
+LATE_PICK_S = 30.0
 
 
 class HeraclesStateUpdater(Node):
@@ -74,6 +95,26 @@ class HeraclesStateUpdater(Node):
         ]
         self.get_logger().info(f"Tracking robots {self.robot_names}")
 
+        # The same picks and places from the executors' action reports, in case
+        # a holding service call never arrives. "" turns it off.
+        self.declare_parameter("action_done_topic", "/action_done")
+        self._action_types = None
+        self._released = {}  # (robot, object) -> when it was last put down
+        topic = self.get_parameter("action_done_topic").value
+        if topic:
+            try:
+                from robot_executor_msgs.msg import ActionDoneMsg, ActionMsg
+            except ImportError:
+                self.get_logger().warn(
+                    "robot_executor_msgs not found: holding is updated only by "
+                    "the update_holding_state service"
+                )
+            else:
+                self._action_types = (ActionMsg.PICK, ActionMsg.PLACE)
+                self.create_subscription(
+                    ActionDoneMsg, topic, self.action_done_callback, 50
+                )
+
     @staticmethod
     def _robot_names_from_config(path):
         if not path:
@@ -124,7 +165,54 @@ class HeraclesStateUpdater(Node):
 
         return response
 
-    def _update_holding_state(self, robot_name, request, response):
+    def action_done_callback(self, msg):
+        """A PICK or PLACE an executor finished: update holding if not done yet."""
+        try:
+            self._on_action_done(msg)
+        except Exception as ex:
+            self.get_logger().error(
+                f"Holding not updated from {msg.robot_name}'s {msg.action_type}: {ex}"
+            )
+
+    def _on_action_done(self, msg):
+        pick, place = self._action_types
+        if not msg.success or msg.action_type not in (pick, place):
+            return
+        robot, object_id = msg.robot_name, msg.object_id.strip()
+        if robot not in self.robot_names:
+            return  # another updater's robot
+        if not object_id:
+            self.get_logger().warn(
+                f"{robot}'s {msg.action_type} SUCCESS names no object (object_id is "
+                "empty): cannot update what it holds"
+            )
+            return
+        released = self._released.get((robot, object_id))
+        if msg.action_type == pick and released is not None:
+            if time.monotonic() - released < LATE_PICK_S:
+                self._already(robot, object_id, "picked and placed", "/action_done")
+                return
+        request = UpdateHoldingState.Request()
+        request.id = object_id
+        request.is_holding = msg.action_type == pick
+        if not request.is_holding and msg.points:
+            request.has_position = True
+            request.position = msg.points[-1]
+        response = UpdateHoldingState.Response()
+        done = self._update_holding_state(robot, request, response, via="/action_done")
+        if response.success and done != ALREADY:
+            self.get_logger().warn(
+                f"Set holding state from /action_done: robot={robot}, "
+                f"object={object_id}, is_holding={request.is_holding} (the "
+                "executor's update_holding_state call has not arrived, or not yet)"
+            )
+        elif not response.success:
+            self.get_logger().error(
+                f"/action_done: could not record {robot}'s {msg.action_type} of "
+                f"{object_id}"
+            )
+
+    def _update_holding_state(self, robot_name, request, response, via=""):
         object_id = request.id
         is_holding = request.is_holding
 
@@ -137,8 +225,17 @@ class HeraclesStateUpdater(Node):
             atomic_queries=True,
             print_profiles=False,
         ) as db:
+            held_by = holder_of(db, object_id)
+            if is_holding and held_by == robot_name:
+                response.success = True  # already recorded
+                return self._already(robot_name, object_id, "holding", via)
             if is_holding:
                 response.success = robot_hold_obj(db, robot_name, object_id)
+            elif held_by != robot_name and via and not request.has_position:
+                # No point and no hold to release: nothing to go on but the
+                # robot's pose, and the service may have used an older one.
+                response.success = True
+                return self._already(robot_name, object_id, "placed", via)
             else:
                 if request.has_position:
                     p = request.position
@@ -146,10 +243,18 @@ class HeraclesStateUpdater(Node):
                 else:
                     robot_pose = self._get_robot_pose(robot_name)
                     put_at = None if robot_pose is None else robot_pose[:3]
+                was_at = object_center(db, object_id)
                 if put_at is None:
                     response.success = False
+                elif (
+                    held_by != robot_name
+                    and was_at is not None
+                    and sum((a - b) ** 2 for a, b in zip(was_at, put_at))
+                    <= ALREADY_PLACED_M**2
+                ):
+                    response.success = True
+                    return self._already(robot_name, object_id, "placed", via)
                 else:
-                    was_at = object_center(db, object_id)
                     # Release first. While HOLDS exists, the holding rule in
                     # dsg_updater keeps snapping the object back onto the
                     # robot, and could undo a position written before it.
@@ -158,6 +263,7 @@ class HeraclesStateUpdater(Node):
                     response.success = last_pos_success and unhold_success
             if response.success:
                 if not is_holding:
+                    self._released[(robot_name, object_id)] = time.monotonic()
                     # Logged, so a rebuild of the map keeps the object where
                     # the robot put it.
                     record(
@@ -183,6 +289,13 @@ class HeraclesStateUpdater(Node):
                             self.get_clock().now().to_msg(),
                         )
                     )
+
+    def _already(self, robot_name, object_id, what, via):
+        self.get_logger().info(
+            f"{robot_name} {what} {object_id}: already in the map"
+            + (f" (report from {via})" if via else "")
+        )
+        return ALREADY
 
     def timer_callback(self):
         for name in self.robot_names:

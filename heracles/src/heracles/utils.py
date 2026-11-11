@@ -9,6 +9,7 @@ from heracles.graph_interface import (
     initialize_db,
     spark_dsg_to_db,
 )
+from heracles.map_reload import KEEP_LABELS, MAP_STATE, reloading_map
 from heracles.query_interface import Neo4jWrapper
 
 
@@ -69,9 +70,22 @@ def load_dsg_to_db(neo4j_uri, neo4j_creds, scene_graph, source_file_path=None):
     with Neo4jWrapper(
         neo4j_uri, neo4j_creds, atomic_queries=True, print_profiles=False
     ) as db:
-        # Clear any existing content from the DB & initialize with the schema
-        print("Initializing the database.")
-        initialize_db(db)
-        # Load the scene graph into the DB
-        print("Loading the scene graph into the database.")
-        spark_dsg_to_db(scene_graph, db, source_file_path=source_file_path)
+        # Held as rebuilding throughout, so the publisher keeps the last map;
+        # the version, robots and holding survive the wipe (map_reload).
+        with reloading_map(db, "Loading a scene graph into Neo4j") as reload:
+            # Clear any existing content from the DB & initialize with the schema
+            print("Initializing the database.")
+            initialize_db(db, keep_labels=KEEP_LABELS)
+            reload.wiped()
+            # Load the scene graph into the DB
+            print("Loading the scene graph into the database.")
+            spark_dsg_to_db(scene_graph, db, source_file_path=source_file_path)
+            # _MapState survived the wipe: the file it names must be this one,
+            # or a rebuild would start from the previous map.
+            if source_file_path is not None:
+                db.execute(
+                    f"MERGE (m:{MAP_STATE}) SET m.prior_path = $p",
+                    p=os.path.abspath(source_file_path),
+                )
+            else:
+                db.execute(f"MATCH (m:{MAP_STATE}) REMOVE m.prior_path")

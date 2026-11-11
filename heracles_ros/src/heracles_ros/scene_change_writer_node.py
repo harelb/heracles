@@ -26,9 +26,18 @@ a key such as "awcd:reconciled:12" in the symbol field). A change missing from
 the next message was withdrawn, and the map is rebuilt without it -- a removed
 object comes back. A message whose added objects have no key is from an older
 sender and is applied as new changes only.
+
+While the map is being reloaded or rebuilt by someone else (the console, a
+seed), incoming changes are queued and applied once it is done, since an
+object added meanwhile could take a symbol the load then reuses; undo and
+reset are refused. One failing message or request is logged and answered
+(success=False): it does not stop the node.
 """
 
+import os
 import threading
+import traceback
+from collections import deque
 
 import rclpy
 from geometry_msgs.msg import Point
@@ -40,7 +49,13 @@ from rclpy.node import Node
 from std_srvs.srv import Trigger
 
 from heracles_ros import change_log
-from heracles_ros.map_state import bump_map_version, get_map_version, get_prior_path
+from heracles_ros.map_state import (
+    bump_map_version,
+    get_map_version,
+    get_prior_path,
+    is_rebuilding,
+    rebuild_state,
+)
 from heracles_ros.scene_change import (
     ADDED,
     KIND_NAMES,
@@ -53,6 +68,8 @@ from heracles_ros.scene_change import (
 
 EDIT_SOURCE_PREFIX = "sget/"
 RESET_SOURCE = "scene_graph/reset"
+# Changes held while the map is reloaded; the oldest go first past this.
+MAX_QUEUED = 200
 
 
 def to_point(xyz):
@@ -131,19 +148,30 @@ class SceneChangeWriter(Node):
         self.snapshot_move_m = float(self.get_parameter("snapshot_move_m").value)
         # Changes, rebuilds and resets one at a time.
         self._lock = threading.Lock()
+        # Changes that arrived while the map was being reloaded.
+        self._queued = deque()
+        try:
+            change_log.ensure_schema(self.db)
+        except Exception as ex:
+            self.get_logger().error(f"Could not set up the change log schema: {ex}")
 
         self.applied_pub = self.create_publisher(
             SceneChangeMsg, "~/scene_changes_applied", 10
         )
         self.create_subscription(SceneChangeMsg, "~/scene_changes", self.on_changes, 10)
         services = MutuallyExclusiveCallbackGroup()
-        self.create_service(Trigger, "~/reset", self.on_reset, callback_group=services)
-        self.create_service(
-            Trigger, "~/undo_last_edit", self.on_undo_last_edit, callback_group=services
-        )
-        self.create_service(
-            Trigger, "~/clear_edits", self.on_clear_edits, callback_group=services
-        )
+        for name, callback in (
+            ("reset", self.on_reset),
+            ("undo_last_edit", self.on_undo_last_edit),
+            ("clear_edits", self.on_clear_edits),
+        ):
+            self.create_service(
+                Trigger,
+                f"~/{name}",
+                self._answering(name, callback),
+                callback_group=services,
+            )
+        self.create_timer(2.0, self._drain_queued)
         self._awcd_clear = self._make_awcd_clear_client(
             self.get_parameter("awcd_clear_service").value
         )
@@ -158,11 +186,58 @@ class SceneChangeWriter(Node):
     # ------------- incoming changes -------------
 
     def on_changes(self, msg: SceneChangeMsg):
-        with self._lock:
-            if is_snapshot(msg, self.snapshot_sources):
-                self._on_snapshot(msg)
-            else:
-                self._on_new_changes(msg)
+        try:
+            with self._lock:
+                if self._queued or is_rebuilding(self.db):
+                    self._queue(msg)
+                    return
+                self._apply(msg)
+        except Exception as ex:
+            self._log_error(f"{msg.source}: changes not applied", ex)
+
+    def _apply(self, msg):
+        if is_snapshot(msg, self.snapshot_sources):
+            self._on_snapshot(msg)
+        else:
+            self._on_new_changes(msg)
+
+    def _queue(self, msg):
+        if len(self._queued) >= MAX_QUEUED:
+            dropped = self._queued.popleft()
+            self.get_logger().warn(
+                f"Map still being reloaded: dropped the oldest queued changes "
+                f"(from {dropped.source})"
+            )
+        self._queued.append(msg)
+        self.get_logger().warn(
+            f"{msg.source}: the map is being reloaded or rebuilt; "
+            f"{len(msg.changes)} change(s) queued until it is done "
+            f"({len(self._queued)} message(s) waiting)",
+            throttle_duration_sec=5.0,
+        )
+
+    def _drain_queued(self):
+        """Apply the changes queued during a reload, once it is over."""
+        if not self._queued:
+            return
+        try:
+            with self._lock:
+                if is_rebuilding(self.db):
+                    return
+                self.get_logger().info(
+                    f"Map reload done: applying {len(self._queued)} queued message(s)"
+                )
+                while self._queued:
+                    msg = self._queued.popleft()
+                    try:
+                        self._apply(msg)
+                    except Exception as ex:
+                        self._log_error(f"{msg.source}: queued changes not applied", ex)
+        except Exception as ex:
+            self._log_error("Queued changes not applied", ex)
+
+    def _log_error(self, what, ex):
+        self.get_logger().error(f"{what}: {ex!r}\n{traceback.format_exc()}")
 
     def _wanted(self, msg):
         return [c for c in msg.changes if c.confidence >= self.min_confidence]
@@ -255,24 +330,47 @@ class SceneChangeWriter(Node):
         return self.prior_param or get_prior_path(self.db)
 
     def _can_rebuild(self) -> bool:
-        return bool(self._prior_path())
+        return not self._prior_problem()
+
+    def _prior_problem(self) -> str:
+        """Why the map cannot be rebuilt now ("" if it can)."""
+        path = self._prior_path()
+        if not path:
+            return (
+                "The map was not seeded from a scene graph file (and prior_dsg_path "
+                "is not set), so there is no original to rebuild it from."
+            )
+        if not os.path.isfile(path):
+            return f"The prior scene graph file {path} does not exist (any more)."
+        return ""
 
     def _rebuild(self):
         import spark_dsg
 
         path = self._prior_path()
+        # Read now, not at startup: a later seed or load may have changed it.
+        self.get_logger().info(f"Rebuilding the map from the prior scene graph {path}")
         if self._prior is None or self._prior[0] != path:
             self._prior = (path, spark_dsg.DynamicSceneGraph.load(path))
-        return change_log.rebuild(self.db, self._prior[1], log=self.get_logger().info)
+        return change_log.rebuild(self.db, self._prior[1], log=self._rebuild_log)
+
+    def _rebuild_log(self, line: str):
+        logger = self.get_logger()
+        if line.startswith("ERROR"):
+            logger.error(line)
+        elif line.startswith("WARNING") or line.startswith("  "):
+            logger.warn(line)
+        else:
+            logger.info(line)
 
     def _drop(self, source, entries, response, what):
         """Deactivate entries, rebuild, announce; fills a Trigger response."""
-        if not self._can_rebuild():
+        problem = self._prior_problem()
+        if not problem and rebuild_state(self.db)[0]:
+            problem = "The map is being reloaded right now; try again when it is done."
+        if problem:
             response.success = False
-            response.message = (
-                "The map was not seeded from a scene graph file (and prior_dsg_path is "
-                "not set), so there is no original to rebuild it from."
-            )
+            response.message = problem
             self.get_logger().warn(f"{source}: {response.message}")
             return response
         change_log.deactivate(self.db, [e["seq"] for e in entries])
@@ -288,6 +386,20 @@ class SceneChangeWriter(Node):
         )
         self.get_logger().info(response.message)
         return response
+
+    def _answering(self, name, callback):
+        """A service callback that answers success=False instead of raising."""
+
+        def answer(request, response):
+            try:
+                return callback(request, response)
+            except Exception as ex:
+                self._log_error(f"~/{name} failed", ex)
+                response.success = False
+                response.message = f"{name} failed: {ex}"
+                return response
+
+        return answer
 
     def on_reset(self, request, response):
         cleared = self._clear_awcd()
@@ -310,6 +422,7 @@ class SceneChangeWriter(Node):
             if not edits:
                 response.success = False
                 response.message = "There is no map edit to undo."
+                self.get_logger().warn(f"undo_last_edit: {response.message}")
                 return response
             last = edits[-1]
             return self._drop(

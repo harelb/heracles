@@ -20,8 +20,8 @@ prior's, replays the active changes in order, and puts back what robots hold.
 Robot nodes, the version counter and the log itself are kept. Undoing a change
 is then deactivating it and rebuilding, and a reset deactivates them all.
 
-While rebuilding, the map is flagged (map_state.set_rebuilding) so the
-publisher keeps the last map instead of publishing a half-built one.
+While rebuilding, the map is flagged (heracles.map_reload.reloading_map) so
+the publisher keeps the last map instead of publishing a half-built one.
 """
 
 from __future__ import annotations
@@ -30,11 +30,7 @@ import json
 import time
 from typing import Iterable, List, Optional
 
-from heracles_ros.map_state import (
-    bump_map_version,
-    get_holding,
-    set_rebuilding,
-)
+from heracles_ros.map_state import _Transaction, reloading_map
 from heracles_ros.scene_change import (
     ADDED,
     MOVED,
@@ -54,23 +50,61 @@ _MAP_LABELS = ("Object", "MeshPlace", "Place", "Room", "Building")
 OBJECT_OPS = {ADDED: "add_object", REMOVED: "remove_object", MOVED: "move_object"}
 
 
+def ensure_schema(db) -> None:
+    """Make seq unique, so two writers logging at once cannot both take max+1.
+
+    The constraint outlives wipes of the data (it is schema). Creating it fails
+    if the log already has repeated seqs; record then still works, unguarded.
+    """
+    if getattr(db, "_scene_change_schema", False) or isinstance(db, _Transaction):
+        # (in a transaction that writes, Neo4j refuses schema changes and
+        # fails the transaction: map_edit makes the schema before it)
+        return
+    try:
+        db.execute(
+            f"CREATE CONSTRAINT scene_change_seq IF NOT EXISTS "
+            f"FOR (c:{_LOG}) REQUIRE c.seq IS UNIQUE"
+        )
+    except Exception as ex:
+        print(f"change_log: seq uniqueness constraint not created: {ex}")
+    try:
+        db._scene_change_schema = True
+    except AttributeError:
+        pass
+
+
+def _is_seq_clash(ex) -> bool:
+    return type(ex).__name__ == "ConstraintError" or "already exists" in str(ex)
+
+
 def record(db, source: str, op: str, data: dict, key: str = "") -> int:
-    """Append a change to the log; returns its seq."""
-    rows = db.execute(
-        f"""
-        OPTIONAL MATCH (c:{_LOG})
-        WITH coalesce(max(c.seq), 0) + 1 AS seq
-        CREATE (n:{_LOG} {{seq: seq, source: $source, op: $op, data: $data,
-                          key: $key, active: true, time: $t}})
-        RETURN seq
-        """,
-        source=source,
-        op=op,
-        data=json.dumps(data),
-        key=key,
-        t=time.time(),
-    )[0]
-    return int(rows[0]["seq"])
+    """Append a change to the log; returns its seq.
+
+    seq is max+1, read and written in one statement; a writer that raced
+    another to the same seq hits the uniqueness constraint and tries again.
+    """
+    ensure_schema(db)
+    for attempt in range(5):
+        try:
+            rows = db.execute(
+                f"""
+                OPTIONAL MATCH (c:{_LOG})
+                WITH coalesce(max(c.seq), 0) + 1 AS seq
+                CREATE (n:{_LOG} {{seq: seq, source: $source, op: $op, data: $data,
+                                  key: $key, active: true, time: $t}})
+                RETURN seq
+                """,
+                source=source,
+                op=op,
+                data=json.dumps(data),
+                key=key,
+                t=time.time(),
+            )[0]
+            return int(rows[0]["seq"])
+        except Exception as ex:
+            if attempt == 4 or not _is_seq_clash(ex):
+                raise
+            time.sleep(0.01 * (attempt + 1))
 
 
 def record_applied(
@@ -212,44 +246,121 @@ def _load_prior(prior):
     return graph
 
 
+def _map_symbols(db) -> set:
+    """Every map node's symbol (lower case: place edits are logged that way)."""
+    rows = db.execute(
+        "MATCH (n) WHERE "
+        + " OR ".join(f"n:{label}" for label in _MAP_LABELS)
+        + " RETURN n.nodeSymbol AS s"
+    )[0]
+    return {str(r["s"]).lower() for r in rows if r["s"] is not None}
+
+
+def _outside_links(db) -> int:
+    """Edges from map nodes to nodes the rebuild keeps (Observation, ...)."""
+    is_map = " OR ".join(f"n:{label}" for label in _MAP_LABELS)
+    rows = db.execute(
+        f"MATCH (n)-[e]-(m) WHERE ({is_map}) AND NOT ({is_map.replace('n:', 'm:')}) "
+        "AND NOT m:Robot RETURN count(e) AS k"
+    )[0]
+    return int(rows[0]["k"]) if rows else 0
+
+
+def _image_store(db) -> str:
+    """The image store the map was loaded with, if the loader recorded one."""
+    rows = db.execute(
+        "MATCH (m:_GraphMetadata {key: 'image_store'}) "
+        "RETURN coalesce(m.path, m.file_path) AS p"
+    )[0]
+    return (rows[0]["p"] or "") if rows else ""
+
+
+def _logged_symbols(log_entries) -> set:
+    out = set()
+    for c in log_entries:
+        for k in ("symbol", "a", "b"):
+            if c["data"].get(k):
+                out.add(str(c["data"][k]).lower())
+    return out
+
+
 def rebuild(db, prior, log=print) -> List[dict]:
     """Make the map the prior scene graph plus the active changes.
 
     prior is the prior scene graph's path, or a loaded spark_dsg graph (copied,
     not changed). Returns the object changes the rebuild made, as applied
     records, for announcing; the map version is bumped once at the end.
+
+    Only what is in the prior or the change log comes back. Map nodes written
+    some other way (not through record) are dropped, and edges from map nodes
+    to kept nodes (an object's Observations) are lost: both are counted and
+    logged. A change that fails to replay is skipped and logged. If the prior
+    cannot be loaded after the map was deleted, the map is marked failed and
+    held (heracles.map_reload) rather than published half built.
     """
+    import inspect
+
     from heracles.graph_interface import spark_dsg_to_db
 
     graph = _load_prior(prior)
     before = objects(db)
-    holding = get_holding(db)
-    set_rebuilding(db, True)
-    try:
+    before_symbols = _map_symbols(db)
+    links_before = _outside_links(db)
+    load_kwargs = {}
+    image_store = _image_store(db)
+    if image_store:
+        if "image_store" in inspect.signature(spark_dsg_to_db).parameters:
+            load_kwargs["image_store"] = image_store
+        else:
+            log(
+                f"WARNING: the map was loaded with image store {image_store}, but "
+                "this heracles cannot load one: object images are not relinked"
+            )
+    with reloading_map(db, "rebuild from the prior scene graph", log, full=False) as r:
         db.execute(
             "MATCH (n) WHERE "
             + " OR ".join(f"n:{label}" for label in _MAP_LABELS)
             + " DETACH DELETE n"
         )
-        spark_dsg_to_db(graph, db)
+        r.wiped()
+        spark_dsg_to_db(graph, db, **load_kwargs)
+        base_symbols = _map_symbols(db)
         replayed = skipped = 0
+        failed = []
         for c in entries(db):
-            if apply_op(db, c["op"], c["data"]) is None:
+            try:
+                done = apply_op(db, c["op"], c["data"])
+            except Exception as ex:
+                failed.append(f"#{c['seq']} {c['op']} {c['data']}: {ex}")
+                continue
+            if done is None:
                 skipped += 1
             else:
                 replayed += 1
-        for robot, held in holding.items():
-            db.execute(
-                "MATCH (r:Robot {name: $r}), (o:Object) WHERE o.nodeSymbol IN $o "
-                "MERGE (r)-[:HOLDS]->(o)",
-                r=robot,
-                o=held,
-            )
+        dropped = sorted(
+            before_symbols
+            - _map_symbols(db)
+            - base_symbols
+            - _logged_symbols(entries(db, active_only=False))
+        )
+        links_lost = max(0, links_before - _outside_links(db))
         log(
             f"rebuilt the map from the prior scene graph: {replayed} change(s) replayed"
             + (f", {skipped} no longer applicable" if skipped else "")
         )
-    finally:
-        set_rebuilding(db, False)
-    bump_map_version(db)
+        if failed:
+            log(f"WARNING: {len(failed)} change(s) failed to replay and were skipped:")
+            for f in failed:
+                log(f"  {f}")
+        if dropped:
+            log(
+                f"WARNING: the rebuild dropped {len(dropped)} map node(s) that were "
+                "neither in the prior nor in the change log (written around it): "
+                + ", ".join(dropped)
+            )
+        if links_lost:
+            log(
+                f"WARNING: the rebuild lost {links_lost} link(s) from map nodes to "
+                "other nodes (e.g. Object->Observation, so object images)"
+            )
     return object_diff(before, objects(db))

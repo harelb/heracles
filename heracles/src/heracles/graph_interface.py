@@ -73,14 +73,21 @@ if hasattr(spark_dsg, "TravNodeAttributes"):
 # ---------------------------------------------------------------------------
 
 
-def initialize_db(db):
+def initialize_db(db, keep_labels=()):
+    """Delete every node (except those with one of keep_labels) and redo the indexes."""
+
     def try_drop_index(db, index_name):
         try:
             db.execute(f"DROP INDEX {index_name}")
         except neo4j.exceptions.DatabaseError:
             print(f"No index `{index_name}`")
 
-    db.execute("MATCH (n) DETACH DELETE n")
+    keep = " OR ".join(f"n:{label}" for label in keep_labels)
+    db.execute(
+        f"MATCH (n) WHERE NOT ({keep}) DETACH DELETE n"
+        if keep
+        else "MATCH (n) DETACH DELETE n"
+    )
 
     try_drop_index(db, "object_node_symbol")
     try_drop_index(db, "place_node_symbol")

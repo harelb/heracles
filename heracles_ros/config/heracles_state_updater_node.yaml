@@ -7,3 +7,6 @@
     robot_name: $(var robot_name)
     robot_names: ['']  # several robots, e.g. on a base station
     publish_rate: 1.0
+    # Picks and places also from the executors' reports, in case a holding
+    # service call is lost; '' turns it off.
+    action_done_topic: /action_done

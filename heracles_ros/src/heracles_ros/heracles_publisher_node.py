@@ -19,6 +19,7 @@ from heracles_ros.map_state import (
     get_map_version,
     is_rebuilding,
     map_metadata,
+    rebuild_state,
     seed_db,
 )
 
@@ -136,6 +137,15 @@ class HeraclesPublisher(Node):
         # Mid-rebuild the map is partly deleted: planners would see places
         # vanish and stop their robots. Keep the last map until it is done.
         if is_rebuilding(self.db):
+            failed = rebuild_state(self.db)[1]
+            if failed:
+                # Held until a reload or reset succeeds: what Neo4j has now is
+                # not a whole map.
+                self.get_logger().error(
+                    f"Keeping the last map (map_version={self._published_version}): "
+                    f"{failed}. Reload or reset the map to clear this.",
+                    throttle_duration_sec=30.0,
+                )
             return
         version = get_map_version(self.db)
         now = self.get_clock().now()
@@ -188,7 +198,7 @@ class HeraclesPublisher(Node):
         self._last_publish = self.get_clock().now()
         self.get_logger().info(
             f"Published map (map_version={state['map_version']}, "
-            f"holding={state['holding']})"
+            f"map_epoch={state['map_epoch'][:8]}, holding={state['holding']})"
         )
 
     def destroy_node(self):

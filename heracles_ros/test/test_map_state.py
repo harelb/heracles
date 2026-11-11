@@ -14,6 +14,7 @@ import spark_dsg
 from geometry_msgs.msg import Point
 from heracles.graph_interface import db_to_spark_dsg
 from heracles.query_interface import Neo4jWrapper
+from heracles.utils import load_dsg_to_db
 from heracles_ros_interfaces.srv import UpdateHoldingState
 
 from heracles_ros.heracles_state_updater_node import HeraclesStateUpdater
@@ -21,8 +22,13 @@ from heracles_ros.map_state import (
     METADATA_KEY,
     bump_map_version,
     get_holding,
+    get_map_epoch,
     get_map_version,
+    get_prior_path,
+    is_rebuilding,
     map_metadata,
+    rebuild_state,
+    reloading_map,
     seed_db,
 )
 
@@ -52,6 +58,9 @@ def db():
     if not os.path.exists(DSG_PATH):
         pytest.skip(f"No test scene graph at {DSG_PATH}")
     probe = _connect()
+    # Each test starts from an empty database: a reseed keeps robots, what
+    # they hold and the version count, which would carry over between tests.
+    probe.query("MATCH (n) DETACH DELETE n")
     probe.close()
     seed_db(URI, AUTH, DSG_PATH)
     db = _connect()
@@ -71,6 +80,8 @@ def _holding_call(db, is_holding, object_id, position=None, robot_pose=None):
             password=NS(get_secret_value=lambda: AUTH[1]),
         ),
         _get_robot_pose=lambda name: robot_pose,
+        _released={},
+        _already=lambda *a: HeraclesStateUpdater._already(updater, *a),
         get_logger=lambda: NS(info=lambda *_: None, error=lambda *_: None),
         applied_pub=NS(publish=ANNOUNCED.append),
         get_clock=lambda: NS(
@@ -113,12 +124,32 @@ def test_seed_matches_the_file(db):
     assert get_holding(db) == {}
 
 
-def test_reseeding_clears_holding_and_restarts_the_version(db):
+def test_reseeding_keeps_holding_robots_and_counts_on_with_a_new_epoch(db):
     assert _holding_call(db, True, "O4")
-    bump_map_version(db)
+    v = bump_map_version(db)
+    epoch = get_map_epoch(db)
+    db.execute("CREATE (:_SceneChange {seq: 1, active: true})")
     seed_db(URI, AUTH, DSG_PATH)
-    assert get_holding(db) == {}
-    assert get_map_version(db) == 1
+    assert get_holding(db) == {ROBOT: ["O4"]}
+    pose = db.query(f"MATCH (r:Robot {{name: '{ROBOT}'}}) RETURN r.position AS p")
+    assert pose[0]["p"] is not None  # robots are kept through the wipe
+    assert get_map_version(db) == v + 1
+    assert get_map_epoch(db) not in ("", epoch)
+    assert not is_rebuilding(db)
+    assert get_prior_path(db) == os.path.abspath(DSG_PATH)
+    assert not db.query("MATCH (c:_SceneChange) RETURN c")  # a new map: no log
+
+
+def test_a_load_that_fails_after_the_wipe_holds_the_map(db):
+    graph = spark_dsg.DynamicSceneGraph.load(DSG_PATH)
+    with pytest.raises(RuntimeError):
+        with reloading_map(db, "test load", log=lambda *_: None) as reload:
+            db.execute("MATCH (o:Object) DETACH DELETE o")
+            reload.wiped()
+            raise RuntimeError("disk gone")
+    assert is_rebuilding(db) and "disk gone" in rebuild_state(db)[1]
+    load_dsg_to_db(URI, AUTH, graph, source_file_path=DSG_PATH)
+    assert not is_rebuilding(db)
 
 
 def test_pick_and_place_at_the_given_point(db):
@@ -160,7 +191,12 @@ def test_published_graph_carries_version_and_holding(db):
     G.metadata.add(map_metadata(db))
     received = spark_dsg.DynamicSceneGraph.from_binary(G.to_binary(False))
     state = received.metadata.get()[METADATA_KEY]
-    assert state == {"map_version": get_map_version(db), "holding": {ROBOT: ["O4"]}}
+    assert state == {
+        "map_version": get_map_version(db),
+        "map_epoch": get_map_epoch(db),
+        "holding": {ROBOT: ["O4"]},
+    }
+    assert len(state["map_epoch"]) == 32
 
     # A later update replaces the metadata rather than merging into it, so a
     # released object does not linger in `holding`.

@@ -88,14 +88,15 @@ def test_applied_message_carries_the_version():
     assert (msg.changes[0].new_position.x, msg.changes[1].old_position.y) == (3.0, 6.0)
 
 
-def test_seed_resets_versions_then_writes_bump_them(db):
+def test_writes_bump_the_version_and_a_reseed_keeps_counting(db):
     from heracles_ros.map_state import bump_map_version
 
     v = get_map_version(db)
     apply_changes(db, [(MOVED, "O5", "", (12.0, -8.0, 0.5))])
     assert bump_map_version(db) == v + 1
+    # A reload never goes back to a version an older map had.
     seed_db(URI, AUTH, DSG_PATH)
-    assert get_map_version(db) == 1
+    assert get_map_version(db) == v + 2
 
 
 class _FakeDb:
