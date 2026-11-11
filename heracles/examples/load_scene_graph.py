@@ -23,6 +23,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--neo4j_uri", type=str, default=os.getenv("HERACLES_NEO4J_URI")
     )
+    parser.add_argument(
+        "--image_store",
+        type=str,
+        nargs="*",
+        default=[],
+        help="Hydra image store directory (or one per robot) to ingest with the graph",
+    )
     args = parser.parse_args()
     assert args.neo4j_uri, (
         'No NEO4J_URI provided -- either provide as an arg or set "$HERACLES_NEO4J_URI"'
@@ -34,7 +41,11 @@ if __name__ == "__main__":
     summarize_dsg(scene_graph)
 
     load_dsg_to_db(
-        args.neo4j_uri, neo4j_creds, scene_graph, source_file_path=args.scene_graph
+        args.neo4j_uri,
+        neo4j_creds,
+        scene_graph,
+        source_file_path=args.scene_graph,
+        image_store=args.image_store or None,
     )
 
     db = Neo4jWrapper(
