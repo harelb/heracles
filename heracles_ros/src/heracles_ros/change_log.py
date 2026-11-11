@@ -266,11 +266,16 @@ def _outside_links(db) -> int:
     return int(rows[0]["k"]) if rows else 0
 
 
-def _image_store(db) -> str:
-    """The image store the map was loaded with, if the loader recorded one."""
+def _image_store(db):
+    """The image store the map was loaded with, if the loader recorded one.
+
+    heracles.graph_interface.spark_dsg_to_db records its store directories as
+    ``image_store_paths`` (a list, one per robot); ``path`` / ``file_path`` is
+    what older loaders wrote. Returns the list or path, or "" for none.
+    """
     rows = db.execute(
         "MATCH (m:_GraphMetadata {key: 'image_store'}) "
-        "RETURN coalesce(m.path, m.file_path) AS p"
+        "RETURN coalesce(m.image_store_paths, m.path, m.file_path) AS p"
     )[0]
     return (rows[0]["p"] or "") if rows else ""
 
