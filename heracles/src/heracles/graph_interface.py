@@ -18,7 +18,8 @@ Lossy properties
 Some attribute data is NOT round-tripped through Neo4j:
 - TravNodeAttributes boundary (radii, states) — deferred, store only position
 - Place2dNodeAttributes boundary (polygon points) — deferred
-- AgentNodeAttributes (world_R_body, dbow) — not stored
+- AgentNodeAttributes — stored as ``Agent`` rows (pose, stamp) that are not
+  read back by ``db_to_spark_dsg``; dbow vectors are not stored
 
 The source JSON file should be considered the authoritative copy.  Neo4j
 stores the subset needed for visualization and editing.
@@ -27,6 +28,7 @@ Edge handling remains layer-aware since edge types are determined by the
 layer relationship (intralayer vs interlayer), not by attribute types.
 """
 
+import datetime
 import logging
 
 import neo4j
@@ -96,6 +98,7 @@ def initialize_db(db, keep_labels=()):
     try_drop_index(db, "mesh_place_node_symbol")
     try_drop_index(db, "room_node_symbol")
     try_drop_index(db, "building_node_symbol")
+    try_drop_index(db, "agent_node_symbol")
 
     db.execute(
         f"CREATE INDEX object_node_symbol FOR (n:{constants.OBJECTS}) ON (n.nodeSymbol)"
@@ -111,6 +114,9 @@ def initialize_db(db, keep_labels=()):
     )
     db.execute(
         f"CREATE INDEX building_node_symbol FOR (n:{constants.BUILDINGS}) ON (n.nodeSymbol)"
+    )
+    db.execute(
+        f"CREATE INDEX agent_node_symbol FOR (n:{constants.AGENTS}) ON (n.nodeSymbol)"
     )
 
 
@@ -363,6 +369,168 @@ def add_buildings_from_dsg(G, db):
 
 
 # ---------------------------------------------------------------------------
+# Agents (robot keyframe poses)
+# ---------------------------------------------------------------------------
+
+
+def _agent_stamp_ns(attrs):
+    """Agent node stamp in ns, None when unset (the binding defaults it to 0).
+
+    The Python binding returns the stamp as a ``datetime.timedelta``, so the
+    value has microsecond resolution (the last three digits are 0). Looking up
+    the node's keyframe with ``hydra_python.image_store.ImageStore.agent_frame``
+    goes by the agent node id and the nearest stamp within 50 ms, so this does
+    not change which frame is found.
+    """
+    ts = getattr(attrs, "timestamp", None)
+    if ts is None:
+        return None
+    ns = (ts // datetime.timedelta(microseconds=1)) * 1000
+    return ns if ns > 0 else None
+
+
+def _agent_nodes(G):
+    """Every agent node of ``G``.
+
+    Agents share layer id 2 with OBJECTS but live in non-zero partitions (one
+    per robot prefix), so ``G.get_layer(DsgLayers.AGENTS)`` (partition 0) would
+    return the objects. Enumerate the partitions instead.
+    """
+    agents_layer = spark_dsg.DsgLayers.name_to_layer_id("AGENTS").layer
+    for key in G.layer_keys:
+        if key.layer != agents_layer or key.partition == 0:
+            continue
+        for a in G.get_layer(key.layer, key.partition).nodes:
+            if isinstance(a.attributes, spark_dsg.AgentNodeAttributes):
+                yield a
+
+
+def agent_to_dict(agent):
+    """Flat ``Agent`` row: position, orientation (w, x, y, z) and stamp."""
+    attrs = agent.attributes
+    rot = attrs.world_R_body
+    d = {
+        "nodeSymbol": agent.id.str(True),
+        "pos_x": float(attrs.position[0]),
+        "pos_y": float(attrs.position[1]),
+        "pos_z": float(attrs.position[2]),
+        "rot_w": float(rot.w),
+        "rot_x": float(rot.x),
+        "rot_y": float(rot.y),
+        "rot_z": float(rot.z),
+    }
+    ts_ns = _agent_stamp_ns(attrs)
+    if ts_ns is not None:
+        d["timestamp_ns"] = ts_ns
+    return d
+
+
+def insert_agents_to_db(db, agents):
+    """MERGE ``Agent`` nodes (pose and stamp)."""
+    return db.execute(
+        f"""
+    WITH $agents AS agents
+    UNWIND agents AS agent
+    WITH point({{x: agent.pos_x, y: agent.pos_y, z: agent.pos_z}}) AS p3d, agent
+    MERGE (n:{constants.AGENTS} {{nodeSymbol: agent.nodeSymbol}})
+    SET n.center = p3d,
+        n.rot_w = agent.rot_w,
+        n.rot_x = agent.rot_x,
+        n.rot_y = agent.rot_y,
+        n.rot_z = agent.rot_z,
+        n.timestamp_ns = coalesce(agent.timestamp_ns, n.timestamp_ns)
+    """,
+        agents=agents,
+    )
+
+
+def add_agents_from_dsg(G, db):
+    """Insert one ``Agent`` node per agent (keyframe) node of ``G``.
+
+    Returns the number of agents written.
+    """
+    agents = [agent_to_dict(a) for a in _agent_nodes(G)]
+    if agents:
+        insert_agents_to_db(db, agents)
+        insert_agent_edges_to_db(db, *agent_edges(G))
+    return len(agents)
+
+
+def _layer_key(name):
+    key = spark_dsg.DsgLayers.name_to_layer_id(name)
+    return (key.layer, key.partition)
+
+
+# (layer, partition) of the place layers an agent can be in; 20 is the layer id
+# mesh places had before they became partition 1 of the places layer.
+_AGENT_PLACE_LAYERS = {
+    _layer_key("PLACES"): constants.PLACES,
+    _layer_key("MESH_PLACES"): constants.MESH_PLACES,
+    (20, 0): constants.MESH_PLACES,
+}
+
+
+def _place_label(G, node_id):
+    """Heracles label of a place or mesh place node, else None."""
+    layer = G.get_node(node_id).layer
+    return _AGENT_PLACE_LAYERS.get((layer.layer, layer.partition))
+
+
+def agent_edges(G):
+    """The agent edges of ``G``: ``(trajectory, place_agent)``.
+
+    ``trajectory`` holds one ``{"from", "to"}`` row per edge between two agent
+    nodes (the robot path), ``place_agent`` one row per edge between a place or
+    mesh place and an agent, from the place.
+    """
+    agent_ids = {a.id.value for a in _agent_nodes(G)}
+    trajectory, place_agent = [], []
+    for a in _agent_nodes(G):
+        sym = a.id.str(True)
+        for sid in a.siblings():
+            if sid in agent_ids and a.id.value < sid:
+                to_ns = spark_dsg.NodeSymbol(sid).str(True)
+                trajectory.append({"from": sym, "to": to_ns})
+        for nid in list(a.parents()) + list(a.children()):
+            label = _place_label(G, nid)
+            if label is not None:
+                from_ns = spark_dsg.NodeSymbol(nid).str(True)
+                place_agent.append({"from": from_ns, "to": sym, "label": label})
+    return trajectory, place_agent
+
+
+def insert_agent_edges_to_db(db, trajectory, place_agent):
+    """MERGE ``(:Agent)-[:AGENT_CONNECTED]->(:Agent)`` and
+    ``(:Place|:MeshPlace)-[:CONTAINS]->(:Agent)``, so re-ingesting adds no
+    duplicates. Edges to nodes that are not in the database are skipped."""
+    if trajectory:
+        db.execute(
+            f"""
+        WITH $edges AS edges
+        UNWIND edges AS e
+        MATCH (a:{constants.AGENTS} {{nodeSymbol: e.from}})
+        MATCH (b:{constants.AGENTS} {{nodeSymbol: e.to}})
+        MERGE (a)-[:AGENT_CONNECTED]->(b)
+        """,
+            edges=trajectory,
+        )
+    for label in (constants.PLACES, constants.MESH_PLACES):
+        rows = [e for e in place_agent if e["label"] == label]
+        if not rows:
+            continue
+        db.execute(
+            f"""
+        WITH $edges AS edges
+        UNWIND edges AS e
+        MATCH (p:{label} {{nodeSymbol: e.from}})
+        MATCH (a:{constants.AGENTS} {{nodeSymbol: e.to}})
+        MERGE (p)-[:CONTAINS]->(a)
+        """,
+            edges=rows,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Top-level load: spark_dsg → Neo4j
 # ---------------------------------------------------------------------------
 
@@ -382,12 +550,15 @@ def spark_dsg_to_db(G, db, source_file_path=None):
 
     object_ls, room_ls = extract_labelspaces_from_dsg(G)
 
+    add_agents_from_dsg(G, db)
     add_objects_from_dsg(G, db, object_labelspace=object_ls)
     add_places_from_dsg(G, db)
     add_mesh_places_from_dsg(G, db, object_labelspace=object_ls)
     add_rooms_from_dsg(G, db, room_labelspace=room_ls)
     add_buildings_from_dsg(G, db)
     add_edges_from_dsg(G, db)
+    # agents went in before the places: add their edges now that both exist
+    insert_agent_edges_to_db(db, *agent_edges(G))
 
     # Store labelspaces in Neo4j so db_to_spark_dsg() can reconstruct
     # without requiring external YAML files or function arguments.
