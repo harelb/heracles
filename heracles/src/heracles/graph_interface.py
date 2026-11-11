@@ -786,15 +786,26 @@ def _read_labelspace_from_db(db, layer_key):
     return {name: sid for sid, name in zip(ids, names)}
 
 
-def db_to_spark_dsg(db):
+def db_to_spark_dsg(
+    db, layer_id_to_layer_name=None, object_labelspace=None, room_labelspace=None
+):
     """Reconstruct a spark_dsg DynamicSceneGraph from Neo4j.
 
     Reads labelspaces from ``_Labelspace`` nodes in the database.
     Uses ``attr_type`` stored on each node to create the correct attribute
     class.
+
+    The optional arguments keep the older four-argument form working:
+    ``object_labelspace`` / ``room_labelspace`` (``{name: id}``) are used for a
+    layer whose ``_Labelspace`` the database does not have, and
+    ``layer_id_to_layer_name`` is ignored (the layers are fixed).
     """
-    label_to_semantic_id = _read_labelspace_from_db(db, "object")
-    room_label_to_semantic_id = _read_labelspace_from_db(db, "room")
+    label_to_semantic_id = _read_labelspace_from_db(db, "object") or dict(
+        object_labelspace or {}
+    )
+    room_label_to_semantic_id = _read_labelspace_from_db(db, "room") or dict(
+        room_labelspace or {}
+    )
 
     new_scene_graph = spark_dsg.DynamicSceneGraph()
     new_scene_graph.clear(True)
