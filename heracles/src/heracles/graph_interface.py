@@ -452,7 +452,9 @@ def agent_to_dict(agent):
 
 
 def insert_agents_to_db(db, agents):
-    """MERGE ``Agent`` nodes (pose and stamp)."""
+    """MERGE ``Agent`` nodes (pose and stamp). The keyframe image properties
+    (``frame_id``, ``rgb_path``, ``depth_path``) of an agent with an image store
+    keyframe are only overwritten when the row has them."""
     return db.execute(
         f"""
     WITH $agents AS agents
@@ -464,6 +466,9 @@ def insert_agents_to_db(db, agents):
         n.rot_x = agent.rot_x,
         n.rot_y = agent.rot_y,
         n.rot_z = agent.rot_z,
+        n.frame_id = coalesce(agent.frame_id, n.frame_id),
+        n.rgb_path = coalesce(agent.rgb_path, n.rgb_path),
+        n.depth_path = coalesce(agent.depth_path, n.depth_path),
         n.timestamp_ns = coalesce(agent.timestamp_ns, n.timestamp_ns)
     """,
         agents=agents,
