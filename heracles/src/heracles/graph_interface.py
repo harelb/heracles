@@ -475,15 +475,19 @@ def insert_agents_to_db(db, agents):
     )
 
 
-def add_agents_from_dsg(G, db, store=None):
+def add_agents_from_dsg(G, db, store=None, keyframes=None):
     """Insert one ``Agent`` node per agent (keyframe) node of ``G``.
 
     With an image ``store``, each agent with its own keyframe (see
     :func:`split_keyframes`) also gets ``frame_id`` and absolute ``rgb_path`` /
-    ``depth_path``, and the exact frame stamp as ``timestamp_ns``. Returns the
-    number of agents written.
+    ``depth_path``, and the exact frame stamp as ``timestamp_ns``.
+    ``keyframes`` is ``split_keyframes(G, store)`` if already computed. Returns
+    the number of agents written.
     """
-    keyframes = split_keyframes(G, store)[0] if store is not None else {}
+    if store is None:
+        keyframes = {}
+    else:
+        keyframes = (keyframes or split_keyframes(G, store))[0]
     agents = []
     for a in _agent_nodes(G):
         d = agent_to_dict(a)
@@ -789,21 +793,20 @@ def insert_subkeyframes_to_db(db, subframes):
     )
 
 
-def add_subkeyframes_from_dsg(G, db, store):
+def add_subkeyframes_from_dsg(G, db, store, keyframes=None):
     """Insert a ``SubKeyframe`` node for every store keyframe that is not an
     agent's own keyframe (:func:`split_keyframes`), with
     ``(:SubKeyframe)-[:ANCHORED_TO]->(:Agent)`` when it is anchored.
 
     The pose is the anchor agent's pose in ``G`` composed with the frame's
-    anchor_T_body (odometry when the anchor is not in ``G``). Returns the number
-    of SubKeyframe nodes written.
+    anchor_T_body (odometry when the anchor is not in ``G``). ``keyframes`` is
+    ``split_keyframes(G, store)`` if already computed. Returns the number of
+    SubKeyframe nodes written.
     """
     if store is None:
         return 0
-    subframes = [
-        subkeyframe_to_dict(f, store.body_pose(f, G)[0])
-        for f in split_keyframes(G, store)[1]
-    ]
+    others = (keyframes or split_keyframes(G, store))[1]
+    subframes = [subkeyframe_to_dict(f, store.body_pose(f, G)[0]) for f in others]
     if not subframes:
         return 0
     insert_subkeyframes_to_db(db, subframes)
@@ -874,7 +877,7 @@ def insert_observations_to_db(db, observations):
     )
 
 
-# Frame-bearing labels an Observation is linked to by capture timestamp.
+# Frame-bearing labels an Observation is linked to by store frame_id.
 _FRAME_LABELS = (constants.AGENTS, constants.SUBKEYFRAMES)
 
 
@@ -886,6 +889,10 @@ def ensure_provenance_indexes(db):
             f"CREATE INDEX {label.lower()}_timestamp_ns IF NOT EXISTS "
             f"FOR (n:{label}) ON (n.timestamp_ns)"
         )
+        db.execute(
+            f"CREATE INDEX {label.lower()}_frame_id IF NOT EXISTS "
+            f"FOR (n:{label}) ON (n.frame_id)"
+        )
     db.execute(
         f"CREATE INDEX {constants.CAMERA_CALIBS.lower()}_calib_id IF NOT EXISTS "
         f"FOR (n:{constants.CAMERA_CALIBS}) ON (n.calib_id)"
@@ -894,7 +901,9 @@ def ensure_provenance_indexes(db):
 
 def link_observations_to_frames(db):
     """MERGE ``(:Observation)-[:OBSERVED_IN]->(frame)`` for every Agent or
-    SubKeyframe captured at the observation's ``timestamp_ns``.
+    SubKeyframe holding the store frame the observation was made in (same
+    ``frame_id``; store frame ids embed the robot id, so robots whose frames
+    share a stamp are not mixed up).
 
     Observations of frames that are not keyframes get no edge. Returns the
     number of matched (observation, frame) pairs.
@@ -904,8 +913,8 @@ def link_observations_to_frames(db):
     for label in _FRAME_LABELS:
         records, _, _ = db.execute(
             f"""
-        MATCH (o:{constants.OBSERVATIONS}) WHERE o.timestamp_ns IS NOT NULL
-        MATCH (f:{label} {{timestamp_ns: o.timestamp_ns}})
+        MATCH (o:{constants.OBSERVATIONS}) WHERE o.frame_id IS NOT NULL
+        MATCH (f:{label} {{frame_id: o.frame_id}})
         MERGE (o)-[:{constants.OBSERVED_IN}]->(f)
         RETURN count(*) AS n
         """
@@ -932,11 +941,13 @@ def _calib_to_dict(calib):
     }
 
 
-def attach_camera_calibs(db, store, G=None):
+def attach_camera_calibs(db, store, G=None, keyframes=None):
     """Insert a ``CameraCalib`` node per store sensor (``calib_id`` is the
     decimal ``sensor_id``) and ``HAS_CALIB`` edges to it from every Agent and
     anchored SubKeyframe. ``G`` supplies the agent stamps that pick each agent's
-    own keyframe (:func:`split_keyframes`). Returns the number of edges written.
+    own keyframe (:func:`split_keyframes`); ``keyframes`` is
+    ``split_keyframes(G, store)`` if already computed. Returns the number of
+    edges written.
     """
     ensure_provenance_indexes(db)
     calibs = [_calib_to_dict(c) for c in store.sensors() if c is not None]
@@ -954,7 +965,7 @@ def attach_camera_calibs(db, store, G=None):
         calibs=calibs,
     )
     known = {c["sensor_id"] for c in calibs}
-    own, others = split_keyframes(G, store)
+    own, others = keyframes or split_keyframes(G, store)
     agent_pairs = [
         {"ns": _node_symbol_str(a), "calib_id": str(int(f.sensor_id))}
         for a, f in own.items()
@@ -1007,12 +1018,22 @@ def spark_dsg_to_db(G, db, source_file_path=None, image_store=None):
     objects, CameraCalib nodes, and the store directories as
     ``_GraphMetadata {key: 'image_store'}.image_store_paths``.
     """
+    store = open_image_store(image_store)
+    try:
+        _spark_dsg_to_db(G, db, source_file_path, store)
+    finally:
+        # close only a store opened here, not one the caller passed in open
+        if store is not None and store is not image_store:
+            store.close()
+
+
+def _spark_dsg_to_db(G, db, source_file_path, store):
     from .utils import extract_labelspaces_from_dsg
 
-    store = open_image_store(image_store)
     object_ls, room_ls = extract_labelspaces_from_dsg(G)
+    keyframes = split_keyframes(G, store) if store is not None else None
 
-    add_agents_from_dsg(G, db, store)
+    add_agents_from_dsg(G, db, store, keyframes)
     add_objects_from_dsg(G, db, store, object_labelspace=object_ls)
     add_places_from_dsg(G, db)
     add_mesh_places_from_dsg(G, db, object_labelspace=object_ls)
@@ -1023,16 +1044,14 @@ def spark_dsg_to_db(G, db, source_file_path=None, image_store=None):
     insert_agent_edges_to_db(db, *agent_edges(G))
 
     if store is not None:
-        add_subkeyframes_from_dsg(G, db, store)
-        attach_camera_calibs(db, store, G)
+        add_subkeyframes_from_dsg(G, db, store, keyframes)
+        attach_camera_calibs(db, store, G, keyframes)
         link_observations_to_frames(db)
         db.execute(
             "MERGE (m:_GraphMetadata {key: 'image_store'}) "
             "SET m.image_store_paths = $paths",
             paths=_store_paths(store),
         )
-        if store is not image_store:
-            store.close()
 
     # Store labelspaces in Neo4j so db_to_spark_dsg() can reconstruct
     # without requiring external YAML files or function arguments.

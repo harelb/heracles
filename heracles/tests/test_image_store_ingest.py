@@ -259,3 +259,57 @@ def test_staged_ingest_matches_one_shot(db, store_dir):
     assert gi.link_observations_to_frames(db) == 1
     store.close()
     assert snapshot() == expected
+
+
+def test_observations_link_to_their_own_frame_not_one_at_the_same_stamp(db, store_dir):
+    """Another robot's keyframe taken at the same nanosecond gets no edge."""
+    gi.spark_dsg_to_db(build_dsg(), db, image_store=store_dir)
+    db.execute(
+        f"CREATE (:{constants.SUBKEYFRAMES} "
+        "{nodeSymbol: 's_other_robot', timestamp_ns: 100, frame_id: -1})"
+    )
+    assert gi.link_observations_to_frames(db) == 1
+    links = _rows(
+        db,
+        f"MATCH (o:{constants.OBSERVATIONS})-[:{constants.OBSERVED_IN}]->(f) "
+        "RETURN o.timestamp_ns AS t, f.nodeSymbol AS f",
+    )
+    assert links == [{"t": 100, "f": "a0"}]
+
+
+def test_keyframes_are_split_once_per_ingest(db, store_dir, monkeypatch):
+    calls = []
+    split = gi.split_keyframes
+
+    def counting(G, store):
+        calls.append(1)
+        return split(G, store)
+
+    monkeypatch.setattr(gi, "split_keyframes", counting)
+    gi.spark_dsg_to_db(build_dsg(), db, image_store=store_dir)
+    assert len(calls) == 1
+
+
+def test_a_store_opened_by_the_load_is_closed_when_it_fails(
+    db, store_dir, store, monkeypatch
+):
+    closed = []
+    close = image_store.ImageStore.close
+
+    def spy(self):
+        closed.append(self)
+        return close(self)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(image_store.ImageStore, "close", spy)
+    monkeypatch.setattr(gi, "add_subkeyframes_from_dsg", boom)
+    with pytest.raises(RuntimeError, match="boom"):
+        gi.spark_dsg_to_db(build_dsg(), db, image_store=store_dir)
+    assert len(closed) == 1 and closed[0] is not store
+
+    # a store the caller opened stays open for the caller to close
+    with pytest.raises(RuntimeError, match="boom"):
+        gi.spark_dsg_to_db(build_dsg(), db, image_store=store)
+    assert len(closed) == 1
