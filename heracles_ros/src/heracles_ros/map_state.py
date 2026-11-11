@@ -28,11 +28,13 @@ and editors wait. Any other loader should wrap its load in ``reloading_map``
 
 from __future__ import annotations
 
+import os
 import time
 from contextlib import contextmanager
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import spark_dsg
+from heracles.graph_interface import store_mesh_path
 from heracles.map_reload import (  # noqa: F401  re-exported for map writers
     REBUILD_STALE_S,
     bump_map_version,
@@ -137,7 +139,34 @@ def map_metadata(db) -> dict:
     }
 
 
-def seed_db(uri: str, auth: tuple, dsg_path: str) -> int:
+def find_run_image_store(dsg_path: str) -> Optional[str]:
+    """The image store of the run a scene graph belongs to, or ``None``.
+
+    Hydra writes ``<run>/hydra/backend/dsg.json`` next to ``<run>/image_store``; an
+    ``image_store`` directly next to the scene graph is accepted too. A directory
+    without ``store.sqlite`` is not a store.
+    """
+    path = os.path.abspath(dsg_path)
+    parent = os.path.dirname(path)
+    candidates = [os.path.join(parent, "image_store")]
+    if os.path.basename(parent) in ("backend", "frontend") and (
+        os.path.basename(os.path.dirname(parent)) == "hydra"
+    ):
+        run = os.path.dirname(os.path.dirname(parent))
+        candidates.insert(0, os.path.join(run, "image_store"))
+    for c in candidates:
+        if os.path.isfile(os.path.join(c, "store.sqlite")):
+            return c
+    return None
+
+
+def find_run_mesh(dsg_path: str) -> Optional[str]:
+    """The mesh Hydra saved next to ``dsg_path`` (``mesh.ply``), or ``None``."""
+    path = os.path.join(os.path.dirname(os.path.abspath(dsg_path)), "mesh.ply")
+    return path if os.path.isfile(path) else None
+
+
+def seed_db(uri: str, auth: tuple, dsg_path: str, image_store="auto") -> int:
     """Replace the map in the database with the scene graph at ``dsg_path``.
 
     load_dsg_to_db wipes the map and the change log, but keeps what is not the
@@ -146,11 +175,27 @@ def seed_db(uri: str, auth: tuple, dsg_path: str) -> int:
     map is never confused with "no map yet" (0) nor with the map before it. The
     map gets a new epoch and records dsg_path as the original rebuilds start
     from. Returns the new version.
+
+    ``image_store``: ``"auto"`` (default) loads the run's ``<run>/image_store``
+    when there is one (:func:`find_run_image_store`), so objects get their
+    Observations and agents their keyframe images, and
+    ``_GraphMetadata {key: 'image_store'}`` tells the console / SAM3 where the
+    store is; a path (or list) loads that store; ``None`` loads no images.
+    The run's ``mesh.ply`` next to ``dsg_path`` is recorded for viewers.
     """
+    if image_store == "auto":
+        image_store = find_run_image_store(dsg_path)
     load_dsg_to_db(
-        uri, auth, spark_dsg.DynamicSceneGraph.load(dsg_path), source_file_path=dsg_path
+        uri,
+        auth,
+        spark_dsg.DynamicSceneGraph.load(dsg_path),
+        source_file_path=dsg_path,
+        image_store=image_store,
     )
     with Neo4jWrapper(uri, auth, atomic_queries=True, print_profiles=False) as db:
+        mesh = find_run_mesh(dsg_path)
+        if mesh is not None:
+            store_mesh_path(db, mesh)
         return get_map_version(db)
 
 
