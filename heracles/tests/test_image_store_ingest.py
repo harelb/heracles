@@ -140,6 +140,21 @@ def test_split_keyframes_stamp_too_far(store, monkeypatch):
     assert [f.timestamp_ns for f in others] == [1500, 1600, 2000]
 
 
+@pytest.mark.parametrize("missing_agent", [AGENT0, AGENT1])
+def test_missing_anchor_keyframes_remain_subkeyframes(store, missing_agent):
+    G = build_dsg()
+    G.remove_node(missing_agent)
+    own, others = gi.split_keyframes(G, store)
+    assert missing_agent not in own
+    frames = store.frames(kind=image_store.FrameKind.KEYFRAME)
+    assert {f.frame_id for f in frames} == {
+        f.frame_id for f in [*own.values(), *others]
+    }
+    assert {f.frame_id for f in frames if f.anchor_node_id == missing_agent} <= {
+        f.frame_id for f in others
+    }
+
+
 def test_rot_to_quat():
     for q in ([1, 0, 0, 0], [0.5, 0.5, 0.5, 0.5], [0, 1, 0, 0], [0, 0, 0, 1]):
         w, x, y, z = q
@@ -229,6 +244,36 @@ def test_spark_dsg_to_db_with_image_store(db, store_dir, store):
 
     # The image nodes stay out of the reconstructed graph.
     assert gi.db_to_spark_dsg(db).num_nodes() == G.num_nodes() - 2
+
+
+@pytest.mark.parametrize(
+    "missing_agent, expected_stamp, expected_position",
+    [(AGENT0, 100, (1.0, 0.0, 0.0)), (AGENT1, 2000, (2.0, 0.0, 0.0))],
+)
+def test_missing_anchor_keyframes_are_ingested_with_odometry(
+    db, store_dir, store, missing_agent, expected_stamp, expected_position
+):
+    G = build_dsg()
+    G.remove_node(missing_agent)
+    gi.spark_dsg_to_db(G, db, image_store=store_dir)
+    rows = _rows(
+        db,
+        "MATCH (f) WHERE f:Agent OR f:SubKeyframe "
+        "RETURN f.frame_id AS id, f.timestamp_ns AS stamp, f.center AS center, "
+        "labels(f) AS labels",
+    )
+    assert {r["id"] for r in rows} == {
+        f.frame_id for f in store.frames(kind=image_store.FrameKind.KEYFRAME)
+    }
+    recovered = next(r for r in rows if r["stamp"] == expected_stamp)
+    assert constants.SUBKEYFRAMES in recovered["labels"]
+    np.testing.assert_allclose(tuple(recovered["center"]), expected_position)
+    assert _rows(
+        db,
+        "MATCH (f:SubKeyframe)-[:ANCHORED_TO]->(a:Agent) "
+        f"WHERE a.nodeSymbol = '{gi._node_symbol_str(missing_agent)}' "
+        "RETURN count(*) AS n",
+    ) == [{"n": 0}]
 
 
 def test_staged_ingest_matches_one_shot(db, store_dir):

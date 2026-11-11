@@ -356,9 +356,7 @@ def add_objects_from_dsg(G, db, store=None, object_labelspace=None):
 
 
 def add_places_from_dsg(G, db):
-    nodes = [
-        node_to_dict(p) for p in G.get_layer(spark_dsg.DsgLayers.PLACES).nodes
-    ]
+    nodes = [node_to_dict(p) for p in G.get_layer(spark_dsg.DsgLayers.PLACES).nodes]
     insert_nodes_to_db(db, constants.PLACES, nodes)
 
 
@@ -388,9 +386,7 @@ def add_rooms_from_dsg(G, db, room_labelspace=None):
 
 
 def add_buildings_from_dsg(G, db):
-    nodes = [
-        node_to_dict(b) for b in G.get_layer(spark_dsg.DsgLayers.BUILDINGS).nodes
-    ]
+    nodes = [node_to_dict(b) for b in G.get_layer(spark_dsg.DsgLayers.BUILDINGS).nodes]
     insert_nodes_to_db(db, constants.BUILDINGS, nodes)
 
 
@@ -671,7 +667,8 @@ def split_keyframes(G, store):
     node's stamp in ``G``; for an agent without a stamp, the anchored keyframe
     whose ``anchor_T_body`` is the identity. Returns ``(own, others)``:
     ``{agent node id: Frame}`` and the other keyframes in time order (these
-    become ``SubKeyframe`` nodes).
+    become ``SubKeyframe`` nodes). Frames whose anchors are absent from ``G``
+    remain SubKeyframes and use the store's odometry pose.
     """
     from hydra_python.image_store import FrameKind
 
@@ -683,6 +680,10 @@ def split_keyframes(G, store):
             by_anchor.setdefault(int(f.anchor_node_id), []).append(f)
     own = {}
     for a, fs in by_anchor.items():
+        # A missing anchor cannot receive an own keyframe: leaving its frames
+        # in others preserves them with the odometry fallback at ingest.
+        if G is not None and not G.has_node(a):
+            continue
         ts = stamps.get(a)
         if ts is not None:
             best = min(
@@ -1068,8 +1069,7 @@ def _spark_dsg_to_db(G, db, source_file_path, store):
         ids = [int(k) for k in room_ls.keys()]
         names = list(room_ls.values())
         db.execute(
-            "MERGE (m:_Labelspace {layer: 'room'}) "
-            "SET m.ids = $ids, m.names = $names",
+            "MERGE (m:_Labelspace {layer: 'room'}) SET m.ids = $ids, m.names = $names",
             ids=ids,
             names=names,
         )
@@ -1376,14 +1376,18 @@ def db_record_to_spark_attrs(record, object_labelspace, room_labelspace):
         attrs.radii = [float(r) for r in record["radii"]]
         if "states" in record:
             # Convert ints back to TraversabilityState enums for the C++ binding.
-            attrs.states = [spark_dsg.TraversabilityState(int(s)) for s in record["states"]]
+            attrs.states = [
+                spark_dsg.TraversabilityState(int(s)) for s in record["states"]
+            ]
         if "min_radius" in record:
             attrs.min_radius = float(record["min_radius"])
         if "max_radius" in record:
             attrs.max_radius = float(record["max_radius"])
 
     # Place2dNodeAttributes boundary (stored as Point3D list in Neo4j).
-    if hasattr(attrs, "boundary") and isinstance(getattr(attrs, "boundary", None), list):
+    if hasattr(attrs, "boundary") and isinstance(
+        getattr(attrs, "boundary", None), list
+    ):
         if "boundary" in record and isinstance(record["boundary"], list):
             import numpy as np
 
@@ -1393,8 +1397,6 @@ def db_record_to_spark_attrs(record, object_labelspace, room_labelspace):
             ]
 
     return attrs
-
-
 
 
 def insert_edges_to_spark(G, records):
