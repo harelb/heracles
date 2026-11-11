@@ -584,12 +584,14 @@ def add_edges_from_dsg(G, db):
 
 
 def insert_edges(db, edge_type, from_label, to_label, connections):
+    # MERGE, not CREATE: inserting an edge that is already there (loading the
+    # same graph again) must not add a parallel duplicate relationship.
     query = f"""
     WITH $connections AS connections
     UNWIND connections AS connection
     MATCH (n1: {from_label} {{nodeSymbol: connection.from}})
     MATCH (n2: {to_label} {{nodeSymbol: connection.to}})
-    CREATE (n1)-[:{edge_type}]->(n2)
+    MERGE (n1)-[:{edge_type}]->(n2)
     """
     ret = db.execute(query, connections=connections)
     return ret

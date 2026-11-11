@@ -160,6 +160,15 @@ def populated_db():
     db.close()
 
 
+def test_reinserting_edges_adds_no_duplicates(populated_db):
+    count = "MATCH ()-[r]->() RETURN count(r) AS n"
+    before = populated_db.query(count)[0]["n"]
+    G = build_test_dsg()
+    add_dsg_metadata(G)
+    add_edges_from_dsg(G, populated_db)
+    assert populated_db.query(count)[0]["n"] == before
+
+
 def test_rooms(populated_db):
     q = populated_db.query(
         """MATCH (r: Room {nodeSymbol: "R0"}) RETURN r.nodeSymbol as ns, r.center as center"""
