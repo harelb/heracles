@@ -147,6 +147,19 @@ command:
 ros2 launch heracles_ros demo.launch.yaml launch_heracles_publisher:=true launch_hydra_visualizer:=true launch_rviz:=true
 ```
 
+## Console map edits and SGET undo/reset
+
+`heracles.graph_edit.apply_edit` supports console map edits and its own undo history.
+These edits are not yet recorded in the SGET change log. Avoid mixing console edits
+with SGET undo/reset in the same session: a change-log rebuild restores the prior
+map plus active logged changes, discarding console edits (including retired nodes).
+
+Callers can pass `expected_map_version` to `apply_edit`, using the version returned
+by `heracles.map_reload.get_map_version` when they read the map. A mismatch raises
+`EditConflict` before applying any ops, including when an SGET or change-detection
+edit changed the map without advancing the console's `open_set_graph` revision.
+The existing `expected_revision` check remains available for console edit history.
+
 ## Useful Queries
 
 

@@ -973,7 +973,7 @@ class _TxQuery:
         return [r.data() for r in self.uow.run(query)]
 
 
-def _lock_map(uow) -> None:
+def _lock_map(uow, expected_map_version: int | None = None) -> None:
     """Write-lock ``_MapState`` first, as heracles_ros.map_state.map_edit does: every
     rebuild writes it when it starts, so an edit and the start of a rebuild never
     overlap, and the edit is refused while one runs (or after one failed)."""
@@ -982,6 +982,12 @@ def _lock_map(uow) -> None:
         raise MapRebuilding(
             "the map is being rebuilt or reloaded; try again when it is done"
         )
+    if expected_map_version is not None:
+        current_version = get_map_version(_TxQuery(uow))
+        if current_version != expected_map_version:
+            raise EditConflict(
+                f"expected map version {expected_map_version}, found {current_version}"
+            )
 
 
 def _bump_map_version(uow, dirty_layers, affected) -> int:
@@ -1033,6 +1039,7 @@ def apply_edit(
     *,
     provenance: Mapping[str, Any],
     expected_revision: int | None = None,
+    expected_map_version: int | None = None,
     database: str = "neo4j",
     mutation_id: str | None = None,
     summary: str | None = None,
@@ -1042,7 +1049,11 @@ def apply_edit(
     """Apply ``ops`` in one unit of work; returns what happened.
 
     ``expected_revision`` is the ``open_set_graph`` revision the caller planned against
-    (``RevisionConflict`` if it moved); ``None`` takes the current one.  ``dry_run``
+    (``RevisionConflict`` if it moved); ``None`` takes the current one.
+    ``expected_map_version`` optionally checks the shared ``_MapState.version``
+    after taking its write lock, before any ops (``EditConflict`` on mismatch).
+    Pass the version the caller planned against to also detect SGET, change-detection
+    edits and reloads; ``None`` leaves this check disabled. ``dry_run``
     applies everything and rolls back: the result (changes, summary, member counts) is
     exactly what a commit would do, nothing is written.
 
@@ -1064,7 +1075,7 @@ def apply_edit(
         expected_revision=expected_revision,
         mutation_id=mid,
         provenance=dict(provenance),
-        prepare=_lock_map,
+        prepare=lambda uow: _lock_map(uow, expected_map_version),
     ) as uow:
         ap = _Applier(uow, uow.next_revision)
         for i, op in enumerate(ops):
