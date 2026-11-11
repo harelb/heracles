@@ -45,7 +45,7 @@ from heracles_ros.scene_change import (
 )
 
 _LOG = "_SceneChange"
-_MAP_LABELS = ("Object", "MeshPlace", "Place", "Room", "Building")
+_MAP_LABELS = ("Object", "MeshPlace", "Place", "Room", "Building", "Retired")
 
 OBJECT_OPS = {ADDED: "add_object", REMOVED: "remove_object", MOVED: "move_object"}
 

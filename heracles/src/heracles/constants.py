@@ -38,3 +38,12 @@ HERACLES_TO_SPARK_LAYER_NAMES = MappingProxyType(
         BUILDINGS: spark_dsg.DsgLayers.BUILDINGS,
     }
 )
+
+# Object admission properties. graph_edit stamps objects an operator adds as
+# admitted by the operator, keeps these properties through a snapshot, and lets
+# an edit change them; nothing in heracles reads them yet.
+ADMISSION_STATUS = "admission_status"
+ADMISSION_POLICY_VERSION = "admission_policy_version"
+ADMISSION_REASON = "admission_reason"
+ADMISSION_BELIEF = "admission_belief"
+ADMITTED = "admitted"

@@ -12,6 +12,7 @@ from types import SimpleNamespace as NS
 import pytest
 import spark_dsg
 from geometry_msgs.msg import Point
+from heracles import graph_edit
 from heracles.graph_interface import db_to_spark_dsg
 from heracles_ros_interfaces.msg import SceneChange, SceneChangeMsg
 from test_map_state import (  # noqa: F401
@@ -29,6 +30,8 @@ from heracles_ros.map_state import (
     get_map_version,
     get_prior_path,
     is_rebuilding,
+    map_edit,
+    notify_map_change,
 )
 from heracles_ros.scene_change import (
     ADDED,
@@ -81,6 +84,82 @@ def test_rebuild_restores_a_removed_object_and_keeps_an_added_one(db, prior):
     assert [(a["kind"], a["symbol"]) for a in restored] == [(ADDED, "O4")]
     assert [e["seq"] for e in change_log.entries(db)] == [seq]
     db_to_spark_dsg(db)  # the rebuilt map can still be published
+
+
+def test_rebuild_discards_console_edits_and_retired_copies(db, prior):
+    original = object_center(db, "O0")
+    out = graph_edit.apply_edit(
+        db,
+        [
+            {"op": "update_node", "symbol": "O0", "set": {"center": [91, 92, 0]}},
+            {
+                "op": "create_node",
+                "layer": "Object",
+                "class": "crate",
+                "pos": [93, 94, 0],
+            },
+            {"op": "retire_node", "symbol": "O2"},
+        ],
+        provenance={"source": "test"},
+    )
+    crate = next(c["symbol"] for c in out["changes"] if c["kind"] == "create")
+    assert db.query("MATCH (n:Retired {nodeSymbol: 'O2'}) RETURN n")
+    # Active logged changes must still replay while console edits disappear.
+    logged = add_object(db, "", "cone", (95.0, 96.0, 0.0))
+    change_log.record_applied(db, "sget/chat", [logged])
+
+    change_log.rebuild(db, prior)
+
+    assert object_center(db, "O0") == pytest.approx(original)
+    assert object_center(db, crate) is None
+    assert object_center(db, logged["symbol"]) == pytest.approx((95, 96, 0))
+    assert not db.query("MATCH (n:Retired) RETURN n")
+    nodes = db.query("MATCH (n {nodeSymbol: 'O2'}) RETURN labels(n) AS labels")
+    assert [r["labels"] for r in nodes] == [["Object"]]
+    assert db.query("MATCH (m:GraphMutation) RETURN m")
+    db_to_spark_dsg(db)
+
+
+@pytest.mark.parametrize("writer", ["scene_change", "rebuild"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_console_rejects_map_version_stale_after_another_writer(
+    db, prior, writer, dry_run
+):
+    version = get_map_version(db)
+    revision = graph_edit.graph_revision(db)
+    if writer == "scene_change":
+        with map_edit(db) as tx:
+            applied = add_object(tx, "", "cone", (95.0, 96.0, 0.0))
+            change_log.record_applied(tx, "awcd/test", [applied])
+            notify_map_change(tx)
+    else:
+        change_log.rebuild(db, prior)
+    assert graph_edit.graph_revision(db) == revision
+    current = get_map_version(db)
+    assert current > version
+    ops = [{"op": "retire_node", "symbol": "O0"}]
+    with pytest.raises(graph_edit.EditConflict, match="expected map version"):
+        graph_edit.apply_edit(
+            db,
+            ops,
+            provenance={"source": "test"},
+            expected_revision=revision,
+            expected_map_version=version,
+            dry_run=dry_run,
+        )
+    assert object_center(db, "O0") is not None
+    assert not db.query("MATCH (m:GraphMutation) RETURN m")
+    assert graph_edit.graph_revision(db) == revision
+    assert get_map_version(db) == current
+    out = graph_edit.apply_edit(
+        db,
+        ops,
+        provenance={"source": "test"},
+        expected_revision=revision,
+        expected_map_version=current,
+        dry_run=dry_run,
+    )
+    assert out["map_version"] == (None if dry_run else current + 1)
 
 
 def test_rebuild_restores_a_deleted_place_with_its_edges(db, prior):
@@ -285,5 +364,7 @@ def test_an_edit_and_its_log_entry_commit_together_in_map_edit(db):
     assert get_map_version(db) == v + 1
     (entry,) = change_log.entries(db)
     assert entry["op"] == "remove_place" and entry["source"] == "sget/test"
-    rows = db.query("SHOW CONSTRAINTS YIELD name WHERE name = 'scene_change_seq' RETURN name")
+    rows = db.query(
+        "SHOW CONSTRAINTS YIELD name WHERE name = 'scene_change_seq' RETURN name"
+    )
     assert rows  # made, outside the edit
