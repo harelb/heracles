@@ -203,3 +203,14 @@ def test_edges(populated_db):
     assert len(q) == 2
     assert q[0]["o"]["class"] in ["box", "rock"]
     assert q[1]["o"]["class"] in ["box", "rock"]
+
+
+def test_edges_from_a_graph_without_heracles_layer_metadata(populated_db):
+    # Graphs written by Hydra have no LayerIdToHeraclesLayerStr metadata.
+    G = build_test_dsg()
+    assert "LayerIdToHeraclesLayerStr" not in (G.metadata.get() or {})
+    add_edges_from_dsg(G, populated_db)
+    q = populated_db.query(
+        """MATCH (r: Room {nodeSymbol: "R0"})-[:CONTAINS*]->(o: Object) RETURN o"""
+    )
+    assert len(q) >= 2
