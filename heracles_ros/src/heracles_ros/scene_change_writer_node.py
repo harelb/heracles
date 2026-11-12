@@ -18,6 +18,12 @@ from the prior scene graph (prior_dsg_path) without some of them:
                     straight back.
   ~/undo_last_edit  drop the latest map edit made by language (source sget/...)
   ~/clear_edits     drop every map edit made by language
+  ~/keep_detections keep what change detection has put in the map, as it is
+                    now, and forget it as change detection's: its next
+                    snapshot (empty after a change detection reset) no longer
+                    withdraws those changes. Snapshot messages still queued
+                    are dropped. Run it before resetting the detectors, or
+                    their empty snapshots undo the changes.
 
 Sources matching snapshot_sources (change detection: "awcd/") send their whole
 current change set in every message instead of new changes only. Each change
@@ -26,6 +32,12 @@ a key such as "awcd:reconciled:12" in the symbol field). A change missing from
 the next message was withdrawn, and the map is rebuilt without it -- a removed
 object comes back. A message whose added objects have no key is from an older
 sender and is applied as new changes only.
+
+Kept changes (keep_detections) are logged under "kept/<source>" with their
+key. A snapshot that still reports one of them (a robot whose reset came
+later, or a replayed report) does not apply it again: a kept removal by its
+key, a kept added object by its key while it is reported within
+keep_match_m of where the map has it.
 
 While the map is being reloaded or rebuilt by someone else (the console, a
 seed), incoming changes are queued and applied once it is done, since an
@@ -68,6 +80,7 @@ from heracles_ros.scene_change import (
 
 EDIT_SOURCE_PREFIX = "sget/"
 RESET_SOURCE = "scene_graph/reset"
+KEPT_PREFIX = "kept/"
 # Changes held while the map is reloaded; the oldest go first past this.
 MAX_QUEUED = 200
 
@@ -105,8 +118,29 @@ def snapshot_key(change) -> str:
     return change.symbol.strip()
 
 
+def is_snapshot_source(source, prefixes) -> bool:
+    return any(source.startswith(p) for p in prefixes if p)
+
+
+def kept_reported(kept_entries, incoming, match_m):
+    """Keys of incoming snapshot changes that kept entries already put in the map."""
+    out = []
+    for e in kept_entries:
+        key = e.get("key") or ""
+        c = incoming.get(key)
+        if c is None:
+            continue
+        if e["op"] == "add_object":
+            xyz = (c.new_position.x, c.new_position.y, c.new_position.z)
+            old = e["data"].get("xyz") or xyz
+            if sum((a - b) ** 2 for a, b in zip(old, xyz)) > match_m**2:
+                continue  # a new object under a reused id
+        out.append(key)
+    return out
+
+
 def is_snapshot(msg, prefixes) -> bool:
-    if not any(msg.source.startswith(p) for p in prefixes if p):
+    if not is_snapshot_source(msg.source, prefixes):
         return False
     return all(snapshot_key(c) for c in msg.changes)
 
@@ -127,6 +161,8 @@ class SceneChangeWriter(Node):
         self.declare_parameter("snapshot_sources", ["awcd/"])
         # An added object reported again this far from where the map has it moves.
         self.declare_parameter("snapshot_move_m", 0.3)
+        # A kept added object reported again this close is the same object.
+        self.declare_parameter("keep_match_m", 1.0)
         self.declare_parameter("awcd_clear_service", "awcd_base_station/clear_robots")
         ip = self.get_parameter("heracles_ip").value
         port = self.get_parameter("heracles_port").value
@@ -146,6 +182,7 @@ class SceneChangeWriter(Node):
         self._prior = None  # (path, scene graph), loaded on the first rebuild
         self.snapshot_sources = list(self.get_parameter("snapshot_sources").value)
         self.snapshot_move_m = float(self.get_parameter("snapshot_move_m").value)
+        self.keep_match_m = float(self.get_parameter("keep_match_m").value)
         # Changes, rebuilds and resets one at a time.
         self._lock = threading.Lock()
         # Changes that arrived while the map was being reloaded.
@@ -164,6 +201,7 @@ class SceneChangeWriter(Node):
             ("reset", self.on_reset),
             ("undo_last_edit", self.on_undo_last_edit),
             ("clear_edits", self.on_clear_edits),
+            ("keep_detections", self.on_keep_detections),
         ):
             self.create_service(
                 Trigger,
@@ -259,6 +297,12 @@ class SceneChangeWriter(Node):
     def _on_snapshot(self, msg: SceneChangeMsg):
         """Make the map hold exactly this source's current changes."""
         incoming = {snapshot_key(c): c for c in self._wanted(msg)}
+        for key in kept_reported(
+            change_log.entries(self.db, source=KEPT_PREFIX + msg.source),
+            incoming,
+            self.keep_match_m,
+        ):
+            del incoming[key]
         logged = {}
         for e in change_log.entries(self.db, source=msg.source):
             logged.setdefault(e["key"], e)
@@ -445,6 +489,37 @@ class SceneChangeWriter(Node):
                 response,
                 f"Dropped {len(edits)} map edit(s)",
             )
+
+    def on_keep_detections(self, request, response):
+        with self._lock:
+            sources = sorted(
+                {
+                    e["source"]
+                    for e in change_log.entries(self.db)
+                    if is_snapshot_source(e["source"], self.snapshot_sources)
+                }
+            )
+            kept = sum(change_log.relabel(self.db, s, KEPT_PREFIX + s) for s in sources)
+            queued = len(self._queued)
+            self._queued = deque(
+                m
+                for m in self._queued
+                if not is_snapshot_source(m.source, self.snapshot_sources)
+            )
+            dropped = queued - len(self._queued)
+        response.success = True
+        response.message = (
+            f"Kept {kept} change detection change(s) in the map"
+            + (f" (from {', '.join(sources)})" if sources else "")
+            + (
+                f"; dropped {dropped} queued change detection message(s)"
+                if dropped
+                else ""
+            )
+            + "."
+        )
+        self.get_logger().info(f"keep_detections: {response.message}")
+        return response
 
     # ------------- AWCD base station -------------
 
