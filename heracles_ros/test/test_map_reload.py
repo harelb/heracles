@@ -66,6 +66,14 @@ class _Db:
                 if held:
                     self.holding.setdefault(kw["r"], []).extend(held)
                 rows = [{"o": o} for o in held]
+        elif "DELETE h" in query:  # a new session's seed drops every HOLDS
+            rows = [
+                {"r": r, "o": o}
+                for r, held in sorted(self.holding.items())
+                for o in held
+            ]
+            self.holding = {}
+            self.log.append("drop holding")
         elif "SET m.version = CASE" in query:
             ms = self._ms()
             ms["version"] = max(ms.get("version", 0), kw["old"]) + 1
@@ -158,6 +166,65 @@ def test_holding_and_robots_survive_a_wipe_that_took_them():
     assert get_map_version(db) == 3  # max(old) + 1, even though _MapState was wiped
 
 
+def test_a_new_session_seed_drops_holding_and_says_what_it_dropped():
+    pose = {"name": "testbot_a", "qw": 1.0}
+    db = _Db(
+        version=5,
+        robots={"testbot_a": pose, "testbot_b": {"name": "testbot_b"}},
+        holding={"testbot_a": ["O11"], "testbot_b": ["O9"]},
+        objects={"O11", "O9"},
+    )
+    logged = []
+    with reloading_map(db, "seed", log=logged.append, keep_holding=False) as reload:
+        db.wipe(keep_robots=True)
+        reload.wiped()
+        db.objects = {"O11", "O9"}  # the new map has both objects again
+    assert db.holding == {}  # not put back, though the objects are in the map
+    assert reload.dropped == ["testbot_a:O11", "testbot_b:O9"]
+    assert any(
+        "dropped stale holding testbot_a:O11 from a previous run" in line
+        for line in logged
+    )
+    assert any("testbot_b:O9" in line for line in logged)
+    assert db.robots["testbot_a"] == pose  # robots stay
+    assert get_map_version(db) == 6 and not is_rebuilding(db)
+
+
+def test_a_new_session_seed_also_drops_holding_the_wipe_did_not_take():
+    db = _Db(version=1, robots={"testbot_a": {}}, objects={"O3"})
+    with reloading_map(db, "seed", log=lambda *_: None, keep_holding=False) as r:
+        db.wipe()
+        r.wiped()
+        db.objects = {"O3"}
+        db.holding = {"testbot_a": ["O3"]}  # e.g. a loader that kept edges
+    assert db.holding == {} and r.dropped == ["testbot_a:O3"]
+
+
+def test_a_new_session_seed_that_fails_after_the_wipe_still_reports_the_drop():
+    db = _Db(version=4, robots={"testbot_a": {}}, holding={"testbot_a": ["O1"]},
+             objects={"O1"})  # fmt: skip
+    logged = []
+    with pytest.raises(RuntimeError):
+        with reloading_map(db, "seed", log=logged.append, keep_holding=False) as r:
+            db.wipe()
+            r.wiped()
+            raise RuntimeError("bad image store")
+    assert any("dropped stale holding testbot_a:O1" in line for line in logged)
+
+
+def test_a_mid_session_reload_keeps_holding_by_default():
+    db = _Db(version=2, robots={"testbot_a": {}}, holding={"testbot_a": ["O11"]},
+             objects={"O11"})  # fmt: skip
+    logged = []
+    _load(db, {"O11"})
+    with reloading_map(db, "console map load", log=logged.append) as reload:
+        db.wipe()
+        reload.wiped()
+        db.objects = {"O11"}
+    assert db.holding == {"testbot_a": ["O11"]} and reload.dropped == []
+    assert not any("dropped" in line for line in logged)
+
+
 def test_a_load_failing_after_the_wipe_leaves_the_map_held():
     db = _Db(version=4, objects={"O1"})
     with pytest.raises(RuntimeError):
@@ -225,6 +292,21 @@ def test_load_dsg_to_db_holds_the_map_and_records_its_file(monkeypatch):
     assert db.state["prior_path"].endswith("maps/dsg.json")
     assert get_map_version(db) == 7 and len(get_map_epoch(db)) == 32
     assert not is_rebuilding(db) and "testbot_d" in db.robots
+    assert db.holding == {}  # nothing was held
+
+    # keep_holding reaches the reload: a new session's load drops HOLDS
+    db.objects = {"O1", "O2"}
+    db.holding = {"testbot_d": ["O2"]}
+    logged = []
+    heracles_utils.load_dsg_to_db(
+        "neo4j://x", ("u", "p"), graph, "maps/dsg.json", keep_holding=False,
+        log=logged.append,
+    )  # fmt: skip
+    assert db.holding == {}
+    assert any("dropped stale holding testbot_d:O2" in line for line in logged)
+    db.holding = {"testbot_d": ["O2"]}
+    heracles_utils.load_dsg_to_db("neo4j://x", ("u", "p"), graph, "maps/dsg.json")
+    assert db.holding == {"testbot_d": ["O2"]}  # the default keeps it
 
 
 def test_a_long_load_keeps_renewing_its_mark(monkeypatch):

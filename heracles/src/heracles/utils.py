@@ -46,7 +46,13 @@ def extract_labelspaces_from_dsg(G):
 
 
 def load_dsg_to_db(
-    neo4j_uri, neo4j_creds, scene_graph, source_file_path=None, image_store=None
+    neo4j_uri,
+    neo4j_creds,
+    scene_graph,
+    source_file_path=None,
+    image_store=None,
+    keep_holding=True,
+    log=print,
 ):
     """Load a DSG into Neo4j.
 
@@ -57,6 +63,10 @@ def load_dsg_to_db(
     recorded so that the map can later be rebuilt from that file (undo, reset).
     ``image_store`` optionally adds the run's images (see
     ``graph_interface.spark_dsg_to_db``); it needs ``hydra_python``.
+
+    ``keep_holding``: what robots hold survives the load (a reload within a
+    session). False for the seed of a new session: every HOLDS from the previous
+    run is dropped and logged through ``log`` (heracles.map_reload).
     """
     # Set the layer id to layer name mappings
     spark_layer_id_to_heracles_layer_str = {
@@ -75,8 +85,11 @@ def load_dsg_to_db(
         neo4j_uri, neo4j_creds, atomic_queries=True, print_profiles=False
     ) as db:
         # Held as rebuilding throughout, so the publisher keeps the last map;
-        # the version, robots and holding survive the wipe (map_reload).
-        with reloading_map(db, "Loading a scene graph into Neo4j") as reload:
+        # the version and robots survive the wipe, holding too unless this is a new
+        # session's seed (map_reload).
+        with reloading_map(
+            db, "Loading a scene graph into Neo4j", log=log, keep_holding=keep_holding
+        ) as reload:
             # Clear any existing content from the DB & initialize with the schema
             print("Initializing the database.")
             initialize_db(db, keep_labels=KEEP_LABELS)

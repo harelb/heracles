@@ -3,6 +3,7 @@
 import logging
 import os
 import time
+from functools import partial
 
 import numpy as np
 import rclpy
@@ -78,14 +79,26 @@ class HeraclesPublisher(Node):
         if self.get_parameter("seed_on_start").value:
             if seed_path and os.path.isfile(seed_path):
                 store = find_run_image_store(seed_path)
+                # Seeding starts a session: what robots held in an earlier run
+                # is dropped (each one logged), or the planner would plan to put
+                # down an object picked hours ago. A reload mid-session (console
+                # map load, rebuild) keeps holding.
+                seed = partial(
+                    seed_db,
+                    self.URI,
+                    self.AUTH,
+                    seed_path,
+                    new_session=True,
+                    log=self.get_logger().warning,
+                )
                 try:
-                    version = seed_db(self.URI, self.AUTH, seed_path, image_store=store)
+                    version = seed(image_store=store)
                 except ImageStoreError as e:
                     # e.g. a store in an older format: the map matters more
                     # than its images
                     self.get_logger().error(f"{e}; seeding without images")
                     store = None
-                    version = seed_db(self.URI, self.AUTH, seed_path, image_store=None)
+                    version = seed(image_store=None)
                 self.get_logger().info(
                     f"Seeded Neo4j from {seed_path} (map_version={version}, "
                     f"image store: {store or 'none found next to the scene graph'})"

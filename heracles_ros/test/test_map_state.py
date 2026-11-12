@@ -124,12 +124,50 @@ def test_seed_matches_the_file(db):
     assert get_holding(db) == {}
 
 
+def _an_object(db):
+    """Some object of the test map (any scene graph will do for holding)."""
+    rows = db.query("MATCH (o:Object) RETURN o.nodeSymbol AS s ORDER BY s LIMIT 1")
+    assert rows, "the test scene graph has no objects"
+    return rows[0]["s"]
+
+
+def test_a_new_session_seed_drops_holding_from_the_previous_run(db):
+    # The 2026-11-11 field run: a pick in an earlier run left euclid holding O11,
+    # and the next session's seed (ADT4_NEO4J_SEED=true) kept it.
+    obj = _an_object(db)
+    assert _holding_call(db, True, obj)
+    assert get_holding(db) == {ROBOT: [obj]}
+    v = get_map_version(db)
+    logged = []
+    seed_db(URI, AUTH, DSG_PATH, log=logged.append)  # new_session by default
+    assert get_holding(db) == {}
+    assert map_metadata(db)[METADATA_KEY]["holding"] == {}
+    assert any(
+        f"dropped stale holding {ROBOT}:{obj} from a previous run" in line
+        for line in logged
+    )
+    pose = db.query(f"MATCH (r:Robot {{name: '{ROBOT}'}}) RETURN r.position AS p")
+    assert pose[0]["p"] is not None  # the robot itself is kept
+    assert get_map_version(db) > v and not is_rebuilding(db)
+
+
+def test_a_reload_within_a_session_keeps_holding(db):
+    # A console map load or a reseed mid-session: the robot still has it in hand.
+    obj = _an_object(db)
+    assert _holding_call(db, True, obj)
+    seed_db(URI, AUTH, DSG_PATH, new_session=False)
+    assert get_holding(db) == {ROBOT: [obj]}
+    graph = spark_dsg.DynamicSceneGraph.load(DSG_PATH)
+    load_dsg_to_db(URI, AUTH, graph, source_file_path=DSG_PATH)
+    assert get_holding(db) == {ROBOT: [obj]}
+
+
 def test_reseeding_keeps_holding_robots_and_counts_on_with_a_new_epoch(db):
     assert _holding_call(db, True, "O4")
     v = bump_map_version(db)
     epoch = get_map_epoch(db)
     db.execute("CREATE (:_SceneChange {seq: 1, active: true})")
-    seed_db(URI, AUTH, DSG_PATH)
+    seed_db(URI, AUTH, DSG_PATH, new_session=False)
     assert get_holding(db) == {ROBOT: ["O4"]}
     pose = db.query(f"MATCH (r:Robot {{name: '{ROBOT}'}}) RETURN r.position AS p")
     assert pose[0]["p"] is not None  # robots are kept through the wipe
