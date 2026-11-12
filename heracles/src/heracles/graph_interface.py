@@ -163,8 +163,10 @@ def node_to_dict(node, object_labelspace=None, room_labelspace=None):
         label_key = str(attrs.semantic_label)
         if type(attrs) is spark_dsg.SemanticNodeAttributes:
             # hydra's open-vocabulary regions: semantic_label indexes the region
-            # prompts, not a labelspace; the matched prompt is the node's name
-            pass
+            # prompts, which hydra writes as the room labelspace (Hydra #210);
+            # older graphs carried the matched prompt as the node's name instead
+            if room_labelspace and label_key in room_labelspace:
+                d["class"] = room_labelspace[label_key]
         elif ls and label_key in ls:
             d["class"] = ls[label_key]
         else:
@@ -375,6 +377,32 @@ def add_mesh_places_from_dsg(G, db, object_labelspace=None):
     insert_nodes_to_db(db, constants.MESH_PLACES, nodes)
 
 
+def name_unnamed_regions(nodes):
+    """Name hydra's open-vocabulary regions that have a class but no name.
+
+    Hydra (#210) no longer writes a region's name; consoles, Cypher and the chat
+    refer to regions by name.  Each unnamed region takes its class ("lawn");
+    regions sharing a class are numbered in symbol order ("lawn", "lawn 2", ...).
+    Named regions and other room types are left as they are.
+    """
+    taken = {n["name"] for n in nodes if n.get("name")}
+    count = {}
+    for n in sorted(nodes, key=lambda n: (len(n["nodeSymbol"]), n["nodeSymbol"])):
+        if n.get("name") or not n.get("class") or n.get("attr_type") != "SemanticNodeAttributes":
+            continue
+        base = n["class"]
+        k = count.get(base, 0)
+        while True:
+            k += 1
+            name = base if k == 1 else f"{base} {k}"
+            if name not in taken:
+                break
+        count[base] = k
+        taken.add(name)
+        n["name"] = name
+    return nodes
+
+
 def add_rooms_from_dsg(G, db, room_labelspace=None):
     if room_labelspace is None:
         room_labelspace = {}
@@ -382,7 +410,7 @@ def add_rooms_from_dsg(G, db, room_labelspace=None):
         node_to_dict(r, room_labelspace=room_labelspace)
         for r in G.get_layer(spark_dsg.DsgLayers.ROOMS).nodes
     ]
-    insert_nodes_to_db(db, constants.ROOMS, nodes)
+    insert_nodes_to_db(db, constants.ROOMS, name_unnamed_regions(nodes))
 
 
 def add_buildings_from_dsg(G, db):
