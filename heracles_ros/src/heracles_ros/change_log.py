@@ -5,7 +5,8 @@ into it directly, and a deleted node was gone until the next run. Now every
 change is also recorded, in order, as a ``_SceneChange`` node:
 
 * ``seq``     order of the change
-* ``source``  who made it: "awcd/<robot>", "sget/chat", "executor/<robot>"
+* ``source``  who made it: "awcd/<robot>", "sget/chat", "executor/<robot>",
+              "kept/awcd/<robot>" (change detection's, kept: keep_detections)
 * ``op``      add_object, move_object, remove_object, add_place, remove_place,
               add_connection, remove_connection
 * ``data``    JSON of the op's arguments, with the ids it was given (an added
@@ -148,6 +149,17 @@ def deactivate(db, seqs: Iterable[int]) -> int:
         f"MATCH (c:{_LOG}) WHERE c.seq IN $seqs AND c.active "
         "SET c.active = false RETURN count(c) AS n",
         seqs=seqs,
+    )[0]
+    return int(rows[0]["n"])
+
+
+def relabel(db, source: str, new_source: str) -> int:
+    """Move the active entries of ``source`` to ``new_source``; how many moved."""
+    rows = db.execute(
+        f"MATCH (c:{_LOG}) WHERE c.active AND c.source = $source "
+        "SET c.source = $new RETURN count(c) AS n",
+        source=source,
+        new=new_source,
     )[0]
     return int(rows[0]["n"])
 

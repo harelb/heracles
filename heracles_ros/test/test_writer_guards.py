@@ -207,6 +207,7 @@ class _Writer:
     _prior_problem = SceneChangeWriter._prior_problem
     _can_rebuild = SceneChangeWriter._can_rebuild
     on_undo_last_edit = SceneChangeWriter.on_undo_last_edit
+    on_keep_detections = SceneChangeWriter.on_keep_detections
 
     def __init__(self, prior=""):
         import threading
@@ -299,3 +300,46 @@ def test_nothing_to_undo_is_logged(monkeypatch):
     response = w.on_undo_last_edit(None, NS(success=True, message=""))
     assert response.success is False
     assert ("warn", "undo_last_edit: There is no map edit to undo.") in w.logger.lines
+
+
+def test_keep_detections_relabels_change_detection_and_drops_its_queue(monkeypatch):
+    logged = [
+        {"source": "awcd/reconciled", "op": "remove_object", "data": {}},
+        {"source": "sget/chat", "op": "remove_place", "data": {}},
+        {"source": "awcd/reconciled", "op": "add_object", "data": {}},
+    ]
+    moved = []
+    monkeypatch.setattr(writer_node.change_log, "entries", lambda db: logged)
+    monkeypatch.setattr(
+        writer_node.change_log,
+        "relabel",
+        lambda db, s, new: moved.append((s, new)) or 2,
+    )
+    w = _Writer()
+    w._queued.extend([_msg("awcd/reconciled"), _msg("sget/chat")])
+    response = w.on_keep_detections(None, NS(success=False, message=""))
+    assert response.success
+    assert moved == [("awcd/reconciled", "kept/awcd/reconciled")]
+    assert "Kept 2" in response.message and "dropped 1 queued" in response.message
+    assert [m.source for m in w._queued] == ["sget/chat"]
+
+
+def test_kept_reported_matches_keys_and_nearby_added_objects():
+    def change(x):
+        return NS(new_position=NS(x=x, y=0.0, z=0.0))
+
+    kept = [
+        {"key": "removed:O4", "op": "remove_object", "data": {"symbol": "O4"}},
+        {"key": "awcd:reconciled:7", "op": "add_object", "data": {"xyz": [0, 0, 0]}},
+        {"key": "awcd:reconciled:8", "op": "add_object", "data": {"xyz": [0, 0, 0]}},
+    ]
+    incoming = {
+        "removed:O4": change(0),
+        "awcd:reconciled:7": change(0.5),  # the same object
+        "awcd:reconciled:8": change(5.0),  # a reused id: a new object
+        "awcd:reconciled:9": change(0),
+    }
+    assert writer_node.kept_reported(kept, incoming, 1.0) == [
+        "removed:O4",
+        "awcd:reconciled:7",
+    ]
