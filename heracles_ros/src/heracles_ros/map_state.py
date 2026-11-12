@@ -9,7 +9,8 @@ the published graph. Two things do:
   that new, instead of replanning on the graph from before the change.
 * ``holding``: which robot holds which object. The ``HOLDS`` edges never leave
   the database otherwise, since the published graph carries only the spatial
-  layers.
+  layers. Holding lasts a session: a reload keeps it, the seed that starts a
+  new session (seed_db) drops it.
 
 Both are written into the graph's metadata under ``METADATA_KEY``. Robot pose
 updates do not bump the version: they are not changes to the map.
@@ -166,15 +167,27 @@ def find_run_mesh(dsg_path: str) -> Optional[str]:
     return path if os.path.isfile(path) else None
 
 
-def seed_db(uri: str, auth: tuple, dsg_path: str, image_store="auto") -> int:
+def seed_db(
+    uri: str,
+    auth: tuple,
+    dsg_path: str,
+    image_store="auto",
+    new_session: bool = True,
+    log=print,
+) -> int:
     """Replace the map in the database with the scene graph at ``dsg_path``.
 
     load_dsg_to_db wipes the map and the change log, but keeps what is not the
-    map (heracles.map_reload): robots and what they hold (if the new map still
-    has the object), and the version, which goes on to max(old)+1, so a fresh
-    map is never confused with "no map yet" (0) nor with the map before it. The
-    map gets a new epoch and records dsg_path as the original rebuilds start
-    from. Returns the new version.
+    map (heracles.map_reload): the robots, and the version, which goes on to
+    max(old)+1, so a fresh map is never confused with "no map yet" (0) nor with
+    the map before it. The map gets a new epoch and records dsg_path as the
+    original rebuilds start from. Returns the new version.
+
+    ``new_session`` (default): this seed starts a run (the publisher's
+    seed_on_start, i.e. ADT4_NEO4J_SEED=true), so what robots held in an earlier
+    run is dropped -- each one logged through ``log`` -- and every robot starts
+    with empty hands. Pass False to reseed within a session and keep holding
+    (if the new map still has the object), as a console map load does.
 
     ``image_store``: ``"auto"`` (default) loads the run's ``<run>/image_store``
     when there is one (:func:`find_run_image_store`), so objects get their
@@ -191,6 +204,8 @@ def seed_db(uri: str, auth: tuple, dsg_path: str, image_store="auto") -> int:
         spark_dsg.DynamicSceneGraph.load(dsg_path),
         source_file_path=dsg_path,
         image_store=image_store,
+        keep_holding=not new_session,
+        log=log,
     )
     with Neo4jWrapper(uri, auth, atomic_queries=True, print_profiles=False) as db:
         mesh = find_run_mesh(dsg_path)

@@ -23,6 +23,16 @@ id that changes on every load, so a planner can tell a reloaded map from the
 one it planned on even if the versions match. If the load fails after the
 wipe, the map is marked as failed and stays held -- a half-built map is not
 published -- until a later load or rebuild succeeds.
+
+Holding is kept only within a session. A reload in the middle of one (the
+console's map load, a snapshot restore, a rebuild from the change log) keeps
+what each robot holds: the robots still have it in hand. The seed at the start
+of a new session (``keep_holding=False``; heracles_ros ``seed_db``, which the
+publisher runs when ADT4_NEO4J_SEED=true) must not: a pick from an earlier run
+would otherwise make the planner believe the robot still holds that object, and
+plan to put it down first. That seed drops every HOLDS and logs each one it
+dropped. Robots and their poses are kept either way (the state updater rewrites
+the poses every second); so are the version count and the "rebuilding" mark.
 """
 
 from __future__ import annotations
@@ -163,14 +173,17 @@ def _robots(db):
 class MapReload:
     """What reloading_map saved before the wipe; call wiped() right after it."""
 
-    def __init__(self, db, what, log, full):
+    def __init__(self, db, what, log, full, keep_holding=True):
         self.db = db
         self.what = what
         self.log = log
         self.full = full
+        self.keep_holding = keep_holding
         self.version = get_map_version(db)
         self.robots, self.holding = _robots(db)
         self.is_wiped = False
+        # "robot:object" for every HOLDS a new session's seed dropped.
+        self.dropped = []
 
     def wiped(self) -> None:
         """Mark the map again at once: a full wipe deleted the mark with the map."""
@@ -178,9 +191,11 @@ class MapReload:
         set_rebuilding(self.db, True)
 
     def finish(self) -> list:
-        """Put robots and holding back, version max(old)+1, new epoch if full.
+        """Put robots back, holding too unless keep_holding is False, version
+        max(old)+1, new epoch if full.
 
-        Returns the held objects the new map no longer has.
+        Returns the held objects the new map no longer has (none are kept when
+        keep_holding is False: those are in ``dropped``).
         """
         db = self.db
         for name, props in self.robots.items():
@@ -189,7 +204,17 @@ class MapReload:
                 "MERGE (r:Robot {name: $n}) ON CREATE SET r += $p", n=name, p=props
             )
         lost = []
-        for robot, held in self.holding.items():
+        if not self.keep_holding:
+            # A wipe takes HOLDS with the objects; a load that kept them (or a
+            # writer meanwhile) must not leave one either.
+            rows = db.execute(
+                "MATCH (r:Robot)-[h:HOLDS]->(o) "
+                "WITH r.name AS r, o.nodeSymbol AS o, h DELETE h RETURN r, o"
+            )[0]
+            found = {(robot, o) for robot, held in self.holding.items() for o in held}
+            found |= {(row["r"], row["o"]) for row in rows}
+            self.dropped = [f"{r}:{o}" for r, o in sorted(found)]
+        for robot, held in (self.holding if self.keep_holding else {}).items():
             rows = db.execute(
                 "MATCH (r:Robot {name: $r}), (o:Object) WHERE o.nodeSymbol IN $o "
                 "MERGE (r)-[:HOLDS]->(o) RETURN o.nodeSymbol AS o",
@@ -209,13 +234,16 @@ class MapReload:
 
 
 @contextmanager
-def reloading_map(db, what="map reload", log=print, full=True):
+def reloading_map(db, what="map reload", log=print, full=True, keep_holding=True):
     """Hold the published map while the body replaces it; see the module doc.
 
     full: the whole database is reloaded (a new map epoch). change_log's
     rebuild of the same map passes False.
+    keep_holding: what each robot holds survives the reload (a reload within a
+    session). The seed of a new session passes False: every HOLDS is dropped,
+    and each one is logged.
     """
-    reload = MapReload(db, what, log, full)
+    reload = MapReload(db, what, log, full, keep_holding)
     set_rebuilding(db, True)
     stop = threading.Event()
 
@@ -242,12 +270,25 @@ def reloading_map(db, what="map reload", log=print, full=True):
                 f"{what}: held object(s) not in the new map, no longer held: "
                 + ", ".join(lost)
             )
+        for held in reload.dropped:
+            log(
+                f"{what}: new session: dropped stale holding {held} from a previous "
+                "run (a fresh seed starts with every robot's hands empty)"
+            )
         set_rebuilding(db, False)
     except BaseException as ex:
         stop.set()
         if refresher is not None:
             refresher.join()
         if reload.is_wiped:
+            if not reload.keep_holding:
+                # The wipe took them; a retry starts with no HOLDS to report.
+                for robot, held in sorted(reload.holding.items()):
+                    for o in held:
+                        log(
+                            f"{what}: new session: dropped stale holding "
+                            f"{robot}:{o} from a previous run"
+                        )
             why = f"{what} failed after the map was wiped: {ex!r}"
             log(
                 f"ERROR: {why}. The map is held (not published) until a reload or "
