@@ -232,6 +232,7 @@ class _Writer:
     _announce = SceneChangeWriter._announce
 
     _prior_path = SceneChangeWriter._prior_path
+    on_keep_detections = SceneChangeWriter.on_keep_detections
 
     def __init__(self, db, prior):
         self.db = db
@@ -239,6 +240,10 @@ class _Writer:
         self._prior = (DSG_PATH, prior)
         self.min_confidence = 0.0
         self.snapshot_move_m = 0.3
+        self.keep_match_m = 1.0
+        self.snapshot_sources = ["awcd/"]
+        self._lock = __import__("threading").Lock()
+        self._queued = __import__("collections").deque()
         self.published = []
         self.applied_pub = NS(publish=self.published.append)
         self.get_logger = lambda: NS(info=lambda *_: None, warn=lambda *_: None)
@@ -298,6 +303,47 @@ def test_a_withdrawn_detection_is_undone(db, prior):
     assert change_log.entries(db) == []
     kinds = {(c.kind, c.symbol) for c in w.published[-1].changes}
     assert kinds == {(ADDED, "O4"), (REMOVED, added)}
+
+
+def test_kept_detections_survive_a_change_detection_reset(db, prior):
+    w = _Writer(db, prior)
+    gone = db.query("MATCH (o:Object) RETURN o.nodeSymbol AS s ORDER BY s LIMIT 1")[0][
+        "s"
+    ]
+    w._on_snapshot(
+        _snapshot(
+            removed=[gone], added=[("awcd:reconciled:7", "cone", (2.0, 1.0, 0.0))]
+        )
+    )
+    added = [e for e in change_log.entries(db) if e["op"] == "add_object"][0]["data"][
+        "symbol"
+    ]
+    response = w.on_keep_detections(None, NS(success=False, message=""))
+    assert response.success and "Kept 2" in response.message
+    assert {e["source"] for e in change_log.entries(db)} == {"kept/awcd/reconciled"}
+
+    # A robot reset later still reports them: nothing is applied twice.
+    n = len(w.published)
+    w._on_snapshot(
+        _snapshot(
+            removed=[gone], added=[("awcd:reconciled:7", "cone", (2.2, 1.0, 0.0))]
+        )
+    )
+    assert len(w.published) == n and len(change_log.entries(db)) == 2
+
+    # The detectors' reset: an empty set withdraws nothing.
+    w._on_snapshot(_snapshot())
+    assert object_center(db, gone) is None
+    assert object_center(db, added) is not None
+
+    # A rebuild (an undo elsewhere) replays the kept changes.
+    change_log.rebuild(db, prior)
+    assert object_center(db, gone) is None
+    assert object_center(db, added) is not None
+
+    # New detections after the reset are change detection's again.
+    w._on_snapshot(_snapshot(added=[("awcd:reconciled:7", "cone", (9.0, 1.0, 0.0))]))
+    assert [e["source"] for e in change_log.entries(db)][-1] == "awcd/reconciled"
 
 
 def test_a_detection_reported_elsewhere_moves(db, prior):
