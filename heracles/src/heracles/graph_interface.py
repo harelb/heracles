@@ -926,6 +926,13 @@ def ensure_provenance_indexes(db):
         f"CREATE INDEX {constants.CAMERA_CALIBS.lower()}_calib_id IF NOT EXISTS "
         f"FOR (n:{constants.CAMERA_CALIBS}) ON (n.calib_id)"
     )
+    # attach_camera_calibs matches SubKeyframes by nodeSymbol (initialize_db only
+    # indexes nodeSymbol for the DSG layers); without this every lookup scans all
+    # SubKeyframes, quadratic in their number (~20k on a fused multi-robot map).
+    db.execute(
+        f"CREATE INDEX {constants.SUBKEYFRAMES.lower()}_node_symbol IF NOT EXISTS "
+        f"FOR (n:{constants.SUBKEYFRAMES}) ON (n.nodeSymbol)"
+    )
 
 
 def link_observations_to_frames(db):

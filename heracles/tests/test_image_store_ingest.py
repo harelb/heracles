@@ -306,6 +306,25 @@ def test_staged_ingest_matches_one_shot(db, store_dir):
     assert snapshot() == expected
 
 
+def test_frame_lookups_are_indexed(db, store_dir):
+    """Every property the provenance steps match frames on has an index."""
+    # the db fixture clears nodes, not indexes: drop the one an earlier load made
+    db.execute(f"DROP INDEX {constants.SUBKEYFRAMES.lower()}_node_symbol IF EXISTS")
+    gi.spark_dsg_to_db(build_dsg(), db, image_store=store_dir)
+    indexed = {
+        (r["l"][0], r["p"][0])
+        for r in _rows(
+            db,
+            "SHOW INDEXES YIELD labelsOrTypes AS l, properties AS p "
+            "WHERE l IS NOT NULL RETURN l, p",
+        )
+    }
+    for label in (constants.AGENTS, constants.SUBKEYFRAMES):
+        for prop in ("nodeSymbol", "timestamp_ns", "frame_id"):
+            assert (label, prop) in indexed, (label, prop)
+    assert (constants.CAMERA_CALIBS, "calib_id") in indexed
+
+
 def test_observations_link_to_their_own_frame_not_one_at_the_same_stamp(db, store_dir):
     """Another robot's keyframe taken at the same nanosecond gets no edge."""
     gi.spark_dsg_to_db(build_dsg(), db, image_store=store_dir)
