@@ -388,7 +388,11 @@ def name_unnamed_regions(nodes):
     taken = {n["name"] for n in nodes if n.get("name")}
     count = {}
     for n in sorted(nodes, key=lambda n: (len(n["nodeSymbol"]), n["nodeSymbol"])):
-        if n.get("name") or not n.get("class") or n.get("attr_type") != "SemanticNodeAttributes":
+        if (
+            n.get("name")
+            or not n.get("class")
+            or n.get("attr_type") != "SemanticNodeAttributes"
+        ):
             continue
         base = n["class"]
         k = count.get(base, 0)
@@ -838,6 +842,7 @@ def add_subkeyframes_from_dsg(G, db, store, keyframes=None):
     subframes = [subkeyframe_to_dict(f, store.body_pose(f, G)[0]) for f in others]
     if not subframes:
         return 0
+    ensure_provenance_indexes(db)
     insert_subkeyframes_to_db(db, subframes)
     edges = [
         {"from": s["nodeSymbol"], "to": s["anchor_symbol"]}
@@ -911,8 +916,16 @@ _FRAME_LABELS = (constants.AGENTS, constants.SUBKEYFRAMES)
 
 
 def ensure_provenance_indexes(db):
-    """Idempotent indexes backing :func:`link_observations_to_frames` and
-    :func:`attach_camera_calibs`."""
+    """Idempotent indexes backing :func:`insert_subkeyframes_to_db`,
+    :func:`link_observations_to_frames` and :func:`attach_camera_calibs`."""
+    # SubKeyframes are MERGEd, and their ANCHORED_TO edges matched, by nodeSymbol.
+    # initialize_db indexes the other labels' nodeSymbol but not this one, and a
+    # rebuild from the prior does not go through it: without the index every
+    # MERGE scans all SubKeyframes (18 min to rebuild willow's map, not one).
+    db.execute(
+        f"CREATE INDEX {constants.SUBKEYFRAMES.lower()}_node_symbol IF NOT EXISTS "
+        f"FOR (n:{constants.SUBKEYFRAMES}) ON (n.nodeSymbol)"
+    )
     for label in _FRAME_LABELS + (constants.OBSERVATIONS,):
         db.execute(
             f"CREATE INDEX {label.lower()}_timestamp_ns IF NOT EXISTS "

@@ -191,11 +191,38 @@ def apply_changes(db, changes) -> List[dict]:
     return applied
 
 
-def place_exists(db, symbol) -> bool:
+def _stored_place(db, symbol) -> Optional[str]:
+    """The nodeSymbol of the place ``symbol`` names, as the map stores it.
+
+    Place names are lowercase everywhere outside the map (``t12`` in a PDDL goal,
+    in chat, in the change log); the map stores ``T12`` or ``t12`` depending on
+    the Hydra that built it. A map that has both (an old prior fused with a new
+    run) gets the one spelled exactly as given, else the uppercase one. None if
+    the map has no such place."""
+    symbol = (symbol or "").strip()
     rows = db.execute(
-        "MATCH (p:MeshPlace {nodeSymbol: $s}) RETURN p.nodeSymbol AS s", **{"s": symbol}
+        "MATCH (p:MeshPlace) WHERE toLower(p.nodeSymbol) = $s RETURN p.nodeSymbol AS s",
+        **{"s": symbol.lower()},
     )[0]
-    return bool(rows)
+    stored = sorted(r["s"] for r in rows)
+    if not stored:
+        return None
+    return symbol if symbol in stored else stored[0]
+
+
+def _place_prefix(db) -> str:
+    """The letter this map's places start with (``T`` or ``t``), for a new place."""
+    rows = db.execute(
+        """
+        MATCH (p:MeshPlace) WHERE toLower(left(p.nodeSymbol, 1)) = 't'
+        RETURN left(p.nodeSymbol, 1) AS c, count(*) AS n ORDER BY n DESC LIMIT 1
+        """
+    )[0]
+    return rows[0]["c"] if rows else "t"
+
+
+def place_exists(db, symbol) -> bool:
+    return _stored_place(db, symbol) is not None
 
 
 def next_place_symbol(db) -> str:
@@ -211,18 +238,17 @@ def add_place(db, symbol, x, y, neighbours) -> Optional[dict]:
 
     It copies its nearest place's attributes (type, clearance, ...) except for
     where it is, so the scene graph can be built from it. None if the symbol
-    is taken or a neighbour does not exist.
+    is taken or a neighbour does not exist. The place is stored with the letter
+    case the map's other places have; the returned names are lowercase.
     """
     neighbours = [n.strip().lower() for n in neighbours if n.strip()]
     symbol = (symbol or "").strip().lower() or next_place_symbol(db)
     if place_exists(db, symbol) or not neighbours:
         return None
-    known = db.execute(
-        "MATCH (p:MeshPlace) WHERE p.nodeSymbol IN $n RETURN p.nodeSymbol AS s",
-        **{"n": neighbours},
-    )[0]
-    if len({r["s"] for r in known}) != len(set(neighbours)):
+    known = [_stored_place(db, n) for n in set(neighbours)]
+    if None in known:
         return None
+    stored = _place_prefix(db) + symbol[1:]
     x, y = float(x), float(y)
     db.execute(
         """
@@ -232,14 +258,14 @@ def add_place(db, symbol, x, y, neighbours) -> Optional[dict]:
             p.nodeSymbol = $s, p.center = point({x: $x, y: $y, z: 0.0}),
             p.pos_x = $x, p.pos_y = $y, p.pos_z = 0.0
         """,
-        **{"s": symbol, "x": x, "y": y},
+        **{"s": stored, "x": x, "y": y},
     )
     db.execute(
         """
         MATCH (p:MeshPlace {nodeSymbol: $s}), (q:MeshPlace) WHERE q.nodeSymbol IN $n
         CREATE (p)-[:MESH_PLACE_CONNECTED]->(q), (q)-[:MESH_PLACE_CONNECTED]->(p)
         """,
-        **{"s": symbol, "n": neighbours},
+        **{"s": stored, "n": known},
     )
     return {"symbol": symbol, "x": x, "y": y, "neighbours": neighbours}
 
@@ -250,8 +276,9 @@ def remove_place(db, symbol) -> Optional[dict]:
     Objects it contained move to their nearest remaining place, so they stay
     in the map.
     """
+    stored = _stored_place(db, symbol)
     symbol = (symbol or "").strip().lower()
-    if not place_exists(db, symbol):
+    if stored is None:
         return None
     rows = db.execute(
         """
@@ -259,13 +286,13 @@ def remove_place(db, symbol) -> Optional[dict]:
         OPTIONAL MATCH (p)-[r]-()
         RETURN count(r) AS edges
         """,
-        **{"s": symbol},
+        **{"s": stored},
     )[0]
     contained = db.execute(
         "MATCH (:MeshPlace {nodeSymbol: $s})-[:CONTAINS]->(o:Object) RETURN o.nodeSymbol AS o",
-        **{"s": symbol},
+        **{"s": stored},
     )[0]
-    db.execute("MATCH (p:MeshPlace {nodeSymbol: $s}) DETACH DELETE p", **{"s": symbol})
+    db.execute("MATCH (p:MeshPlace {nodeSymbol: $s}) DETACH DELETE p", **{"s": stored})
     for r in contained:
         _relink_to_nearest_place(db, r["o"])
     return {
@@ -276,6 +303,7 @@ def remove_place(db, symbol) -> Optional[dict]:
 
 
 def _connections(db, a, b) -> int:
+    """How many connections the stored places ``a`` and ``b`` have (either way)."""
     rows = db.execute(
         """
         MATCH (p:MeshPlace {nodeSymbol: $a})-[r:MESH_PLACE_CONNECTED]-(q:MeshPlace {nodeSymbol: $b})
@@ -288,31 +316,33 @@ def _connections(db, a, b) -> int:
 
 def remove_connection(db, a, b) -> Optional[dict]:
     """Delete the connection between two places, both directions."""
+    stored_a, stored_b = _stored_place(db, a), _stored_place(db, b)
     a, b = (a or "").strip().lower(), (b or "").strip().lower()
-    if not _connections(db, a, b):
+    if not (stored_a and stored_b) or not _connections(db, stored_a, stored_b):
         return None
     db.execute(
         """
         MATCH (p:MeshPlace {nodeSymbol: $a})-[r:MESH_PLACE_CONNECTED]-(q:MeshPlace {nodeSymbol: $b})
         DELETE r
         """,
-        **{"a": a, "b": b},
+        **{"a": stored_a, "b": stored_b},
     )
     return {"a": a, "b": b}
 
 
 def add_connection(db, a, b) -> Optional[dict]:
     """Connect two existing places both ways (no-op if already connected)."""
+    stored_a, stored_b = _stored_place(db, a), _stored_place(db, b)
     a, b = (a or "").strip().lower(), (b or "").strip().lower()
-    if a == b or not (place_exists(db, a) and place_exists(db, b)):
+    if stored_a == stored_b or not (stored_a and stored_b):
         return None
-    if _connections(db, a, b):
+    if _connections(db, stored_a, stored_b):
         return None
     db.execute(
         """
         MATCH (p:MeshPlace {nodeSymbol: $a}), (q:MeshPlace {nodeSymbol: $b})
         CREATE (p)-[:MESH_PLACE_CONNECTED]->(q), (q)-[:MESH_PLACE_CONNECTED]->(p)
         """,
-        **{"a": a, "b": b},
+        **{"a": stored_a, "b": stored_b},
     )
     return {"a": a, "b": b}
