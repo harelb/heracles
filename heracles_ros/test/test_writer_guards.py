@@ -216,6 +216,7 @@ class _Writer:
         self.db = object()
         self._lock = threading.Lock()
         self._queued = deque()
+        self._missing = {}
         self.prior_param = prior
         self.snapshot_sources = ["awcd/"]
         self.applied = []

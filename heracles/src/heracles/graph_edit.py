@@ -1117,6 +1117,38 @@ def apply_edit(
         return out
 
 
+def replay_ops(db, ops: Sequence[Mapping], *, database: str = "neo4j") -> dict:
+    """Re-apply the ops of an edit already made, after the map was reloaded under it.
+
+    For heracles_ros' change_log.rebuild, which reloads the prior and then puts
+    back the mission-prep files the console applied: the ops run in one
+    transaction with :func:`apply_edit`'s op code, but while the map is marked
+    rebuilding (apply_edit refuses then), and without a new ``GraphMutation``,
+    revision or map-version bump. The original edit stays the record, and its
+    undo still applies to the map the replay leaves; the rebuild bumps the
+    version when it is done.
+
+    An op that no longer applies (:class:`EditError`: a node it names is gone,
+    a node it creates is already there) is skipped. Returns ``{"applied": n,
+    "skipped": [why, ...], "changes": [...]}``.
+    """
+    driver = _driver(db)
+    revision = graph_revision(driver, database=database)
+    applied, skipped = 0, []
+    with driver.session(database=database) as session:
+        with session.begin_transaction() as tx:
+            ap = _Applier(tx, revision)
+            for i, op in enumerate(ops):
+                try:
+                    ap.apply(op)
+                    applied += 1
+                except EditError as e:
+                    name = op.get("op") if isinstance(op, Mapping) else "?"
+                    skipped.append(f"op {i + 1} ({name}): {e}")
+            tx.commit()
+    return {"applied": applied, "skipped": skipped, "changes": ap.changes}
+
+
 def undo_edit(
     db,
     mutation_id: str | None = None,

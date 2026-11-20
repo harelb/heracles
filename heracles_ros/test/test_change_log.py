@@ -229,12 +229,19 @@ class _Writer:
     _prior_problem = SceneChangeWriter._prior_problem
     _rebuild_log = SceneChangeWriter._rebuild_log
     _rebuild = SceneChangeWriter._rebuild
+    _prior_graph = SceneChangeWriter._prior_graph
+    _withdrawn_keys = SceneChangeWriter._withdrawn_keys
+    _withdraw = SceneChangeWriter._withdraw
+    _log_error = SceneChangeWriter._log_error
+    _drop = SceneChangeWriter._drop
+    on_reset = SceneChangeWriter.on_reset
+    _clear_awcd = SceneChangeWriter._clear_awcd
     _announce = SceneChangeWriter._announce
 
     _prior_path = SceneChangeWriter._prior_path
     on_keep_detections = SceneChangeWriter.on_keep_detections
 
-    def __init__(self, db, prior):
+    def __init__(self, db, prior, withdraw_after_msgs=1, withdraw_after_s=0.0):
         self.db = db
         self.prior_param = ""  # use the path the fixture seeded from
         self._prior = (DSG_PATH, prior)
@@ -242,11 +249,21 @@ class _Writer:
         self.snapshot_move_m = 0.3
         self.keep_match_m = 1.0
         self.snapshot_sources = ["awcd/"]
+        self.withdraw_after_msgs = withdraw_after_msgs
+        self.withdraw_after_s = withdraw_after_s
+        self._missing = {}
+        self.now = 0.0
+        self._now = lambda: self.now
+        self._awcd_clear = None
         self._lock = __import__("threading").Lock()
         self._queued = __import__("collections").deque()
         self.published = []
         self.applied_pub = NS(publish=self.published.append)
-        self.get_logger = lambda: NS(info=lambda *_: None, warn=lambda *_: None)
+        self.get_logger = lambda: NS(
+            info=lambda *_, **__: None,
+            warn=lambda *_, **__: None,
+            error=lambda *_, **__: None,
+        )
         self.get_clock = lambda: NS(
             now=lambda: NS(
                 to_msg=lambda: __import__(
@@ -414,3 +431,298 @@ def test_an_edit_and_its_log_entry_commit_together_in_map_edit(db):
         "SHOW CONSTRAINTS YIELD name WHERE name = 'scene_change_seq' RETURN name"
     )
     assert rows  # made, outside the edit
+
+
+# ---------- withdrawn detections: undone in place, after a grace period ----------
+
+
+def _no_rebuild(monkeypatch):
+    def fail(*a, **k):
+        pytest.fail("a withdrawn detection must not rebuild the map")
+
+    monkeypatch.setattr(change_log, "rebuild", fail)
+
+
+def _node(db, sym):
+    rows = db.query(
+        f"MATCH (n {{nodeSymbol: '{sym}'}}) OPTIONAL MATCH (p)-[:CONTAINS]->(n) "
+        "RETURN labels(n) AS l, properties(n) AS p, collect(p.nodeSymbol) AS parents"
+    )
+    return rows[0] if rows else None
+
+
+def _moved(msg, sym, xyz):
+    msg.changes.append(
+        SceneChange(
+            kind=2,  # MOVED
+            symbol=sym,
+            new_position=Point(x=xyz[0], y=xyz[1], z=xyz[2]),
+            confidence=1.0,
+        )
+    )
+    return msg
+
+
+def test_a_withdrawn_removal_comes_back_from_the_prior_without_a_rebuild(
+    db, prior, monkeypatch
+):
+    _no_rebuild(monkeypatch)
+    before = _node(db, "O4")
+    # Written around the change log (as a console edit is): a rebuild drops it.
+    other = add_object(db, "O990", "crate", (5.0, 5.0, 0.0))
+    w = _Writer(db, prior)
+    w._on_snapshot(_snapshot(removed=["O4"]))
+    assert object_center(db, "O4") is None
+    v = get_map_version(db)
+
+    w._on_snapshot(_snapshot())
+
+    after = _node(db, "O4")
+    assert after["l"] == before["l"] and after["parents"] == before["parents"]
+    assert after["p"] == before["p"]  # same attributes, position, bbox
+    assert object_center(db, other["symbol"]) is not None  # no rebuild
+    assert get_map_version(db) == v + 1
+    assert w.published[-1].map_version == v + 1
+    assert [(c.kind, c.symbol) for c in w.published[-1].changes] == [(ADDED, "O4")]
+    assert change_log.entries(db) == []
+
+
+def test_a_withdrawn_addition_is_deleted_without_a_rebuild(db, prior, monkeypatch):
+    _no_rebuild(monkeypatch)
+    w = _Writer(db, prior)
+    w._on_snapshot(_snapshot(added=[("awcd:reconciled:3", "car", (2.0, 1.0, 0.0))]))
+    (entry,) = change_log.entries(db)
+    added = entry["data"]["symbol"]
+    assert object_center(db, added) is not None
+    v = get_map_version(db)
+
+    w._on_snapshot(_snapshot())
+
+    assert object_center(db, added) is None
+    assert get_map_version(db) == v + 1
+    assert [(c.kind, c.symbol) for c in w.published[-1].changes] == [(REMOVED, added)]
+
+
+def test_a_withdrawn_move_goes_back_without_a_rebuild(db, prior, monkeypatch):
+    _no_rebuild(monkeypatch)
+    original = object_center(db, "O4")
+    w = _Writer(db, prior)
+    w._on_snapshot(_moved(_snapshot(), "O4", (7.0, 8.0, 0.0)))
+    assert object_center(db, "O4") == pytest.approx((7.0, 8.0, 0.0))
+
+    w._on_snapshot(_snapshot())
+
+    assert object_center(db, "O4") == pytest.approx(original)
+    assert [c.symbol for c in w.published[-1].changes] == ["O4"]
+    assert w.published[-1].changes[0].kind == 2  # MOVED
+
+
+def test_a_withdrawn_removal_of_an_object_not_in_the_prior_comes_back_as_logged(
+    db, prior, monkeypatch
+):
+    _no_rebuild(monkeypatch)
+    added = add_object(db, "", "cone", (3.0, 3.0, 0.0))
+    change_log.record_applied(db, "sget/chat", [added])
+    w = _Writer(db, prior)
+    w._on_snapshot(_snapshot(removed=[added["symbol"]]))
+    assert object_center(db, added["symbol"]) is None
+
+    w._on_snapshot(_snapshot())
+
+    assert object_center(db, added["symbol"]) == pytest.approx((3.0, 3.0, 0.0))
+    assert db.query(
+        f"MATCH (o:Object {{nodeSymbol: '{added['symbol']}'}}) RETURN o.class AS c"
+    ) == [{"c": "cone"}]
+
+
+def test_a_flickering_detection_writes_nothing_until_it_stays_away(
+    db, prior, monkeypatch
+):
+    _no_rebuild(monkeypatch)
+    w = _Writer(db, prior, withdraw_after_msgs=3, withdraw_after_s=5.0)
+    w._on_snapshot(_snapshot(removed=["O4"]))
+    v, n = get_map_version(db), len(w.published)
+
+    # Dropped from two messages, reported again: nothing is written.
+    for t in (1.0, 2.0):
+        w.now = t
+        w._on_snapshot(_snapshot())
+    w.now = 3.0
+    w._on_snapshot(_snapshot(removed=["O4"]))  # back: not applied a second time
+    assert object_center(db, "O4") is None
+    assert get_map_version(db) == v and len(w.published) == n
+    assert len(change_log.entries(db)) == 1
+
+    # Three messages, but only 2 s: still not withdrawn.
+    for t in (4.0, 5.0, 6.0):
+        w.now = t
+        w._on_snapshot(_snapshot())
+    assert object_center(db, "O4") is None and get_map_version(db) == v
+    # Long enough as well: withdrawn, undone once.
+    w.now = 9.5
+    w._on_snapshot(_snapshot())
+    assert object_center(db, "O4") is not None
+    assert get_map_version(db) == v + 1 and len(w.published) == n + 1
+    assert change_log.entries(db) == []
+
+
+# ---------- a rebuild keeps the console's mission-prep files ----------
+
+
+def _apply_prep_file(db, name, ops, seq, via_console=True):
+    """Apply ops as the adt4 console applies a mission-prep file, and record it."""
+    import json
+
+    from heracles_ros.map_state import get_map_epoch
+
+    mutation = None
+    if via_console:
+        out = graph_edit.apply_edit(
+            db, ops, provenance={"via": "mission prep (test)"}, summary=name
+        )
+        mutation = out["mutation_id"]
+    rec = {
+        "name": name,
+        "summary": name,
+        "hash": "x",
+        "epoch": get_map_epoch(db),
+        "t": 0.0,
+        "via": "test",
+        "counts": "",
+        "seq": seq,
+        "file_json": json.dumps({"name": name, "intent": [], "ops": ops}),
+    }
+    if mutation:
+        rec["mutation_id"] = mutation
+    db.execute("CREATE (r:_PrepApplied) SET r = $p", p=rec)
+    return mutation
+
+
+def _mesh_places(db, n):
+    rows = db.query(
+        "MATCH (p:MeshPlace) RETURN p.nodeSymbol AS s, p.center AS c ORDER BY s "
+        f"LIMIT {n}"
+    )
+    return [(r["s"], (r["c"].x, r["c"].y, r["c"].z)) for r in rows]
+
+
+def _prep_ops(db):
+    (p1, c1), (p2, _), (p3, _), (p4, _) = _mesh_places(db, 4)
+    ops = [
+        {"op": "delete_node", "symbol": "O0"},
+        {"op": "delete_node", "symbol": "O2"},
+        {"op": "create_node", "layer": "Object", "symbol": "O900", "class": "cone",
+         "pos": [c1[0], c1[1], c1[2] + 0.35], "size": 0.5, "source": "mission_prep"},
+        {"op": "create_edge", "from": p1, "to": "O900", "type": "CONTAINS"},
+        {"op": "retire_node", "symbol": p2},
+        {"op": "group", "parent_layer": "Room", "symbol": "R900", "class": "base camp",
+         "name": "base camp", "members": [p3, p4], "member_layers": ["MeshPlace"]},
+    ]  # fmt: skip
+    return ops, (p1, p2, p3, p4)
+
+
+def _assert_prep_applied(db, places, moved=False):
+    p1, p2, p3, p4 = places
+    assert object_center(db, "O0") is None and object_center(db, "O2") is None
+    if not moved:  # (a logged move relinks it to the place nearest its new spot)
+        assert _node(db, "O900")["parents"] == [p1]
+    assert _node(db, p2)["l"] == ["Retired"]
+    room = db.query(
+        "MATCH (r:Room {nodeSymbol: 'R900'})-[:CONTAINS]->(p:MeshPlace) "
+        "RETURN r.name AS name, collect(p.nodeSymbol) AS members"
+    )
+    assert room[0]["name"] == "base camp"
+    assert sorted(room[0]["members"]) == sorted([p3, p4])
+
+
+def test_a_reset_reapplies_the_mission_prep_files(db, prior):
+    from heracles_ros.map_state import get_map_epoch
+
+    ops, places = _prep_ops(db)
+    mutation = _apply_prep_file(db, "mission_4", ops, seq=1)
+    # A file whose first op names an object the map does not have: skipped,
+    # the rest of the file still applies. Not applied by a console: the ops
+    # come from the file.
+    p5 = _mesh_places(db, 5)[4][0]
+    _apply_prep_file(
+        db,
+        "stale",
+        [
+            {"op": "delete_node", "symbol": "O77777"},
+            {"op": "retire_node", "symbol": p5},
+        ],
+        seq=2,
+        via_console=False,
+    )
+    detection = add_object(db, "", "car", (2.0, 1.0, 0.0))
+    change_log.record_applied(db, "awcd/reconciled", [detection], "awcd:reconciled:1")
+    epoch = get_map_epoch(db)
+    mutations = len(db.query("MATCH (m:GraphMutation) RETURN m"))
+
+    w = _Writer(db, prior)
+    response = w.on_reset(None, NS(success=False, message=""))
+
+    assert response.success, response.message
+    assert object_center(db, detection["symbol"]) is None  # the reset dropped it
+    _assert_prep_applied(db, places)
+    assert _node(db, p5)["l"] == ["Retired"]
+    assert get_map_epoch(db) == epoch
+    assert len(db.query("MATCH (r:_PrepApplied) RETURN r")) == 2
+    assert len(db.query("MATCH (m:GraphMutation) RETURN m")) == mutations
+    db_to_spark_dsg(db)
+
+    # The console's undo of the file still applies to the rebuilt map.
+    graph_edit.undo_edit(db, mutation, provenance={"via": "test"})
+    assert object_center(db, "O0") is not None and object_center(db, "O900") is None
+    assert _node(db, places[1])["l"] == ["MeshPlace"]
+
+
+def test_a_rebuild_replays_prep_files_before_the_log_and_logs_failures(db, prior):
+    ops, places = _prep_ops(db)
+    _apply_prep_file(db, "mission_4", ops, seq=1)
+    # A logged change on the object the file added: replays after the file.
+    change_log.record(
+        db, "sget/chat", "move_object", {"symbol": "O900", "xyz": [9.0, 9.0, 0.0]}
+    )
+    move = __import__("heracles_ros.scene_change", fromlist=["x"]).move_object
+    move(db, "O900", (9.0, 9.0, 0.0))
+    # A file from an earlier epoch (a reseed since) is not applied.
+    db.execute(
+        "CREATE (:_PrepApplied {name: 'old', epoch: 'gone', seq: 9, file_json: $f})",
+        f='{"ops": [{"op": "delete_node", "symbol": "O4"}]}',
+    )
+    # A file the console's own undo took back is not applied.
+    undone = _apply_prep_file(
+        db, "undone", [{"op": "delete_node", "symbol": "O6"}], seq=3
+    )
+    graph_edit.undo_edit(db, undone, provenance={"via": "test"})
+    logged = []
+
+    change_log.rebuild(db, prior, log=logged.append)
+
+    _assert_prep_applied(db, places, moved=True)
+    assert object_center(db, "O900") == pytest.approx((9.0, 9.0, 0.0))
+    assert object_center(db, "O4") is not None
+    assert object_center(db, "O6") is not None
+    text = "\n".join(logged)
+    assert "re-applied mission-prep file 'mission_4'" in text
+    assert "'undone' was undone" in text
+
+
+def test_the_map_is_rebuilt_only_if_undoing_in_place_fails(db, prior, monkeypatch):
+    w = _Writer(db, prior)
+    w._on_snapshot(_snapshot(removed=["O4"]))
+
+    def broken(*a, **k):
+        raise RuntimeError("lost the connection")
+
+    monkeypatch.setattr(change_log, "revert", broken)
+    rebuilds = []
+    real = change_log.rebuild
+    monkeypatch.setattr(
+        change_log, "rebuild", lambda *a, **k: rebuilds.append(1) or real(*a, **k)
+    )
+    w._on_snapshot(_snapshot())
+    assert rebuilds == [1]
+    assert object_center(db, "O4") is not None
+    assert [(c.kind, c.symbol) for c in w.published[-1].changes] == [(ADDED, "O4")]

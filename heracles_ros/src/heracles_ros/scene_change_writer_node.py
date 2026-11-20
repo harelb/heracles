@@ -29,9 +29,21 @@ Sources matching snapshot_sources (change detection: "awcd/") send their whole
 current change set in every message instead of new changes only. Each change
 carries the reporter's id (removed objects: the prior symbol; added objects:
 a key such as "awcd:reconciled:12" in the symbol field). A change missing from
-the next message was withdrawn, and the map is rebuilt without it -- a removed
-object comes back. A message whose added objects have no key is from an older
-sender and is applied as new changes only.
+the messages that follow was withdrawn, and is undone in place
+(change_log.revert): a removed object comes back from the prior scene graph,
+an added one is deleted, a moved one goes back. The map is not rebuilt for it
+(only if undoing in place fails): a rebuild reloads the whole map. A message
+whose added objects have no key is from an older sender and is applied as new
+changes only.
+
+Change detection's set flickers (an object reported, dropped, reported
+again), so a change counts as withdrawn only once it has been missing from
+withdraw_after_msgs messages in a row AND for withdraw_after_s seconds. A
+change reported again before that stays as it is: nothing is written, and the
+map version does not change.
+
+  withdraw_after_msgs (int, default 3)    consecutive snapshots without it
+  withdraw_after_s    (float, default 5.0) seconds since it first went missing
 
 Kept changes (keep_detections) are logged under "kept/<source>" with their
 key. A snapshot that still reports one of them (a robot whose reset came
@@ -48,6 +60,7 @@ reset are refused. One failing message or request is logged and answered
 
 import os
 import threading
+import time
 import traceback
 from collections import deque
 
@@ -164,6 +177,10 @@ class SceneChangeWriter(Node):
         # A kept added object reported again this close is the same object.
         self.declare_parameter("keep_match_m", 1.0)
         self.declare_parameter("awcd_clear_service", "awcd_base_station/clear_robots")
+        # A snapshot change is withdrawn once missing this many messages in a
+        # row and this long (change detection's set flickers).
+        self.declare_parameter("withdraw_after_msgs", 3)
+        self.declare_parameter("withdraw_after_s", 5.0)
         ip = self.get_parameter("heracles_ip").value
         port = self.get_parameter("heracles_port").value
         assert ip and port > 0, "Please set the database IP and port"
@@ -183,6 +200,11 @@ class SceneChangeWriter(Node):
         self.snapshot_sources = list(self.get_parameter("snapshot_sources").value)
         self.snapshot_move_m = float(self.get_parameter("snapshot_move_m").value)
         self.keep_match_m = float(self.get_parameter("keep_match_m").value)
+        self.withdraw_after_msgs = int(self.get_parameter("withdraw_after_msgs").value)
+        self.withdraw_after_s = float(self.get_parameter("withdraw_after_s").value)
+        # (source, key) of logged snapshot changes missing from the latest
+        # messages: (messages missing from, when first missing).
+        self._missing = {}
         # Changes, rebuilds and resets one at a time.
         self._lock = threading.Lock()
         # Changes that arrived while the map was being reloaded.
@@ -303,20 +325,20 @@ class SceneChangeWriter(Node):
             self.keep_match_m,
         ):
             del incoming[key]
-        logged = {}
+        logged, by_key = {}, {}
         for e in change_log.entries(self.db, source=msg.source):
             logged.setdefault(e["key"], e)
-        withdrawn = [e for k, e in logged.items() if k not in incoming]
+            by_key.setdefault(e["key"], []).append(e)
+        withdrawn = [
+            e
+            for k in self._withdrawn_keys(
+                msg.source, [k for k in logged if k not in incoming]
+            )
+            for e in by_key[k]
+        ]
         applied = []
         if withdrawn:
-            if self._can_rebuild():
-                change_log.deactivate(self.db, [e["seq"] for e in withdrawn])
-                applied += self._rebuild()
-            else:
-                self.get_logger().warn(
-                    f"{msg.source} withdrew {len(withdrawn)} change(s), but they stay "
-                    "in the map: no prior scene graph to rebuild it from"
-                )
+            applied += self._withdraw(msg.source, withdrawn)
         for key, c in incoming.items():
             xyz = (c.new_position.x, c.new_position.y, c.new_position.z)
             entry = logged.get(key)
@@ -343,6 +365,70 @@ class SceneChangeWriter(Node):
                         )
                         applied.append(done)
         self._announce(msg.source, applied, 0, quiet=not msg.changes and not withdrawn)
+
+    def _now(self) -> float:
+        return time.monotonic()
+
+    def _withdrawn_keys(self, source, missing):
+        """Of the keys missing from this message, those now withdrawn.
+
+        A key is withdrawn once missing from withdraw_after_msgs messages in a
+        row and for withdraw_after_s seconds; a key that came back starts over.
+        """
+        now = self._now()
+        missing = set(missing)
+        for k in [k for k in self._missing if k[0] == source and k[1] not in missing]:
+            del self._missing[k]
+        out, waiting = [], 0
+        for key in sorted(missing):
+            n, since = self._missing.get((source, key), (0, now))
+            n += 1
+            if n >= self.withdraw_after_msgs and now - since >= self.withdraw_after_s:
+                self._missing.pop((source, key), None)
+                out.append(key)
+            else:
+                self._missing[(source, key)] = (n, since)
+                waiting += 1
+        if waiting:
+            self.get_logger().info(
+                f"{source}: {waiting} change(s) missing from its snapshot; undone "
+                f"once missing from {self.withdraw_after_msgs} messages and for "
+                f"{self.withdraw_after_s:g} s",
+                throttle_duration_sec=5.0,
+            )
+        return out
+
+    def _withdraw(self, source, withdrawn):
+        """Undo withdrawn changes in place; rebuild the map only if that fails.
+
+        Returns the applied records to announce.
+        """
+        change_log.deactivate(self.db, [e["seq"] for e in withdrawn])
+        prior = None
+        if any(e["op"] != "add_object" for e in withdrawn):
+            try:
+                prior = self._prior_graph()
+            except Exception as ex:
+                self._log_error("The prior scene graph could not be loaded", ex)
+        applied = []
+        try:
+            for e in sorted(withdrawn, key=lambda e: -e["seq"]):
+                done = change_log.revert(self.db, e, prior, log=self._rebuild_log)
+                if done is not None:
+                    applied.append(done)
+        except Exception as ex:
+            self._log_error(f"{source}: undoing a withdrawn change in place failed", ex)
+            if not self._can_rebuild():
+                self.get_logger().warn(
+                    f"{source}: withdrawn change(s) may stay in the map: "
+                    + self._prior_problem()
+                )
+                return applied
+            return applied + self._rebuild()
+        self.get_logger().info(
+            f"{source} withdrew {len(withdrawn)} change(s): undone in place"
+        )
+        return applied
 
     def _announce(self, source, applied, skipped, quiet=False):
         if not applied:
@@ -388,15 +474,23 @@ class SceneChangeWriter(Node):
             return f"The prior scene graph file {path} does not exist (any more)."
         return ""
 
-    def _rebuild(self):
+    def _prior_graph(self):
+        """The prior scene graph (loaded once per path), or None if there is none."""
         import spark_dsg
 
-        path = self._prior_path()
+        if self._prior_problem():
+            return None
         # Read now, not at startup: a later seed or load may have changed it.
-        self.get_logger().info(f"Rebuilding the map from the prior scene graph {path}")
+        path = self._prior_path()
         if self._prior is None or self._prior[0] != path:
             self._prior = (path, spark_dsg.DynamicSceneGraph.load(path))
-        return change_log.rebuild(self.db, self._prior[1], log=self._rebuild_log)
+        return self._prior[1]
+
+    def _rebuild(self):
+        self.get_logger().info(
+            f"Rebuilding the map from the prior scene graph {self._prior_path()}"
+        )
+        return change_log.rebuild(self.db, self._prior_graph(), log=self._rebuild_log)
 
     def _rebuild_log(self, line: str):
         logger = self.get_logger()
@@ -418,6 +512,7 @@ class SceneChangeWriter(Node):
             self.get_logger().warn(f"{source}: {response.message}")
             return response
         change_log.deactivate(self.db, [e["seq"] for e in entries])
+        self._missing.clear()
         restored = self._rebuild()
         version = get_map_version(self.db)
         if restored:
@@ -500,6 +595,7 @@ class SceneChangeWriter(Node):
                 }
             )
             kept = sum(change_log.relabel(self.db, s, KEPT_PREFIX + s) for s in sources)
+            self._missing.clear()
             queued = len(self._queued)
             self._queued = deque(
                 m
